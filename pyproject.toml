@@ -36,7 +36,7 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"cloud.py" = ["C901"]  # No complexity check on single-file project
+"cloud.py" = ["C901", "E501"]  # No complexity or line-length check on single-file CLI project
 
 [tool.ty.rules]
 unresolved-import = "ignore"       # ssl._ssl is a private C extension module
