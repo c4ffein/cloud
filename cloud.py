@@ -10,8 +10,12 @@ TODOs and possible improvements: Fill this
 """
 
 import os
+import urllib.request
+from asyncio import gather, get_running_loop
+from asyncio import run as asyncio_run
 from base64 import b64decode
 from enum import Enum
+from functools import partial
 from hashlib import sha1, sha256
 from json import dumps, loads
 from pathlib import Path
@@ -32,13 +36,8 @@ from ssl import (
 )
 from sys import argv, exit
 from sys import flags as sys_flags
-from urllib.error import HTTPError
-import urllib.request
 from time import time as time_time
-from asyncio import run as asyncio_run
-from asyncio import get_running_loop, gather
-from functools import partial
-
+from urllib.error import HTTPError
 
 CAFILE = None  # Set from config "ssl-cafile", required
 LOWER_ALPHANUMERICAL_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -111,12 +110,10 @@ def confirm(message):
 async def make_request(cert_checksum, method, query, body, headers, decode_json=True, decode_utf8=True):
     context = make_pinned_ssl_context(cert_checksum)
     loop = get_running_loop()
-    request = urllib.request.Request(
-        query, data=body.encode('utf-8') if body else None, headers=headers, method=method
-    )
+    request = urllib.request.Request(query, data=body.encode("utf-8") if body else None, headers=headers, method=method)
     try:
         response = await loop.run_in_executor(None, partial(urllib.request.urlopen, request, context=context))
-        data = await loop.run_in_executor(None,response.read)
+        data = await loop.run_in_executor(None, response.read)
     except HTTPError as exc:
         additional_infos = ""
         try:
@@ -127,7 +124,7 @@ async def make_request(cert_checksum, method, query, body, headers, decode_json=
             f"HTTP Error when reaching cloud: {exc.code}"
             + (f"\n{' ' * 8}{additional_infos}" if additional_infos else "")
         ) from exc
-    except socket_timeout as exc:
+    except TimeoutError as exc:
         raise CloudException("Timed out") from exc
     except Exception as exc:
         if isinstance(getattr(exc, "reason", None), socket_timeout):
@@ -150,6 +147,7 @@ async def make_request(cert_checksum, method, query, body, headers, decode_json=
             raise CloudException("Unable to decode utf-8 from the response") from exc
     return data
 
+
 ########################################################################################################################
 ### OVH ################################################################################################################
 
@@ -161,11 +159,11 @@ class OVHApi:
         self.consumer_key = consumer_key
         # API endpoints
         self.endpoints = {
-            'ovh-eu': 'https://eu.api.ovh.com/1.0',
-            'ovh-us': 'https://api.us.ovhcloud.com/1.0',  # unused for now
-            'ovh-ca': 'https://ca.api.ovh.com/1.0',  # unused for now
+            "ovh-eu": "https://eu.api.ovh.com/1.0",
+            "ovh-us": "https://api.us.ovhcloud.com/1.0",  # unused for now
+            "ovh-ca": "https://ca.api.ovh.com/1.0",  # unused for now
         }
-        self.base_url = self.endpoints['ovh-eu']
+        self.base_url = self.endpoints["ovh-eu"]
         self.cert_checksum = cert_checksum
         self.pdf_cert_checksum = pdf_cert_checksum
 
@@ -176,7 +174,7 @@ class OVHApi:
         signature_data = "+".join(
             [self.application_secret, self.consumer_key, method.upper(), query, body or "", str(timestamp)]
         )
-        signature = "$1$" + sha1(signature_data.encode('utf-8')).hexdigest()
+        signature = "$1$" + sha1(signature_data.encode("utf-8")).hexdigest()
         return signature
 
     async def _make_request(self, method, path, data=None, decode_json=True, decode_utf8=True, base_url=None):
@@ -185,18 +183,18 @@ class OVHApi:
         # Prepare body
         body = ""
         headers = {
-            'X-Ovh-Application': self.application_key,
-            'X-Ovh-Consumer': self.consumer_key,
-            'Content-Type': 'application/json'
+            "X-Ovh-Application": self.application_key,
+            "X-Ovh-Consumer": self.consumer_key,
+            "Content-Type": "application/json",
         }
         if data:
             body = dumps(data)
-            headers['Content-Length'] = str(len(body))
-        
+            headers["Content-Length"] = str(len(body))
+
         # Calculate timestamp and signature
         timestamp = int(time_time())
-        headers['X-Ovh-Timestamp'] = str(timestamp)
-        headers['X-Ovh-Signature'] = self._calculate_signature(method, query, body, timestamp)
+        headers["X-Ovh-Timestamp"] = str(timestamp)
+        headers["X-Ovh-Signature"] = self._calculate_signature(method, query, body, timestamp)
         # Create request
         return await make_request(
             self.cert_checksum if base_url is None else self.pdf_cert_checksum,
@@ -205,14 +203,14 @@ class OVHApi:
             body,
             headers,
             decode_json=decode_json,
-            decode_utf8=decode_utf8
+            decode_utf8=decode_utf8,
         )
 
     # Invoices
 
     async def list_invoices(self):
         """List all invoices"""
-        invoice_ids = await self._make_request('GET', '/me/bill')
+        invoice_ids = await self._make_request("GET", "/me/bill")
         if any(not all(c in "FR0123456789" for c in invoice_id) for invoice_id in invoice_ids):
             raise CloudException("Invalid invoice id")
         return invoice_ids
@@ -221,17 +219,19 @@ class OVHApi:
         """Get details of a specific invoice"""
         if not all(c in "FR0123456789" for c in invoice_id):
             raise CloudException("Invalid invoice id")
-        return await self._make_request('GET', f'/me/bill/{invoice_id}')
+        return await self._make_request("GET", f"/me/bill/{invoice_id}")
 
     async def list_invoices_with_details(self):
         """List all invoices with their details"""
         invoice_ids = await self.list_invoices()
-        invoice_ids = invoice_ids[-30:]  # TODO better obviously lol, make a cache, only download on cache miss, then unlimit
+        invoice_ids = invoice_ids[
+            -30:
+        ]  # TODO better obviously lol, make a cache, only download on cache miss, then unlimit
         try:
             results = await gather(*(self.get_invoice_details(invoice_id) for invoice_id in invoice_ids))
         except Exception as exc:
             raise CloudException(f"Error fetching invoices: {exc}") from exc
-        return {invoice_id: details for invoice_id, details in zip(invoice_ids, results)}
+        return dict(zip(invoice_ids, results, strict=False))
 
     async def get_invoice_pdf(self, pdf_url):
         if type(pdf_url) is not str or not pdf_url.startswith("https://www.ovh.com/cgi-bin/order"):
@@ -248,7 +248,7 @@ class OVHApi:
 
     async def list_vps(self):
         """List all vps"""
-        vps_ids = await self._make_request('GET', '/vps')
+        vps_ids = await self._make_request("GET", "/vps")
         for vps_id in vps_ids:
             self._validate_vps_id(vps_id)
         return vps_ids
@@ -256,26 +256,28 @@ class OVHApi:
     async def get_vps_details(self, vps_id):
         """Get details of a specific vps"""
         self._validate_vps_id(vps_id)
-        return await self._make_request('GET', f'/vps/{vps_id}')
+        return await self._make_request("GET", f"/vps/{vps_id}")
 
     async def get_vps_ips(self, vps_id):
         """Get ips of a specific vps"""
         self._validate_vps_id(vps_id)
-        return await self._make_request('GET', f'/vps/{vps_id}/ips')
+        return await self._make_request("GET", f"/vps/{vps_id}/ips")
 
     async def get_vps_service_infos(self, vps_id):
         """Get service_infos of a specific vps"""
         self._validate_vps_id(vps_id)
-        return await self._make_request('GET', f'/vps/{vps_id}/serviceInfos')
+        return await self._make_request("GET", f"/vps/{vps_id}/serviceInfos")
 
     async def list_vps_with_details(self):
         """List all vpss with their details"""
         vps_ids = await self.list_vps()
+
         async def handle(awaitable):
             try:
                 return await awaitable
             except Exception:
                 return {"error": True}
+
         tasks = (
             *(handle(self.get_vps_details(vps_id)) for vps_id in vps_ids),
             *(handle(self.get_vps_ips(vps_id)) for vps_id in vps_ids),
@@ -285,10 +287,10 @@ class OVHApi:
             results = await gather(*tasks)
         except Exception as exc:
             raise CloudException(f"Error fetching vps: {exc}") from exc
-        vps_dict = {vps_id: data for vps_id, data in zip(vps_ids, results[:len(vps_ids)])}
-        for vps_id, ip_data in zip(vps_ids, results[len(vps_ids):len(vps_ids)*2]):
+        vps_dict = dict(zip(vps_ids, results[: len(vps_ids)], strict=False))
+        for vps_id, ip_data in zip(vps_ids, results[len(vps_ids) : len(vps_ids) * 2], strict=False):
             vps_dict[vps_id]["c4_aggregated_ips"] = ip_data
-        for vps_id, service_info_data in zip(vps_ids, results[len(vps_ids)*2:]):
+        for vps_id, service_info_data in zip(vps_ids, results[len(vps_ids) * 2 :], strict=False):
             vps_dict[vps_id]["c4_aggregated_service_infos"] = service_info_data
         return vps_dict
 
@@ -297,7 +299,7 @@ class OVHApi:
         self._validate_vps_id(vps_id)
         if type(new_name) is not str:
             raise CloudException("A string is expected as the new vps name")
-        return await self._make_request('PUT', f'/vps/{vps_id}', {"displayName": new_name})
+        return await self._make_request("PUT", f"/vps/{vps_id}", {"displayName": new_name})
 
     async def list_vps_templates(self, vps_name):
         """WARNING doesn't work for now"""
@@ -307,7 +309,7 @@ class OVHApi:
     async def reinstall_vps(self, vps_name, ssh_key, template_id=0):
         self._validate_vps_id(vps_name)
         if not all(c in ALPHANUMERICAL_CHARS + ".- @/" for c in ssh_key):
-            raise CloudException(f"Invalid ssh key")
+            raise CloudException("Invalid ssh key")
         try:
             template_id = int(template_id)
         except Exception as exc:
@@ -317,7 +319,7 @@ class OVHApi:
             "publicSshKey": ssh_key,
             "doNotSendPassword": True,
         }
-        return await self._make_request('POST', f'/vps/{vps_name}/reinstall', reinstall_body)
+        return await self._make_request("POST", f"/vps/{vps_name}/reinstall", reinstall_body)
 
     # Server
 
@@ -327,7 +329,7 @@ class OVHApi:
 
     async def list_server(self):
         """List all server"""
-        server_ids = await self._make_request('GET', '/dedicated/server')
+        server_ids = await self._make_request("GET", "/dedicated/server")
         for server_id in server_ids:
             self._validate_server_id(server_id)
         return server_ids
@@ -335,12 +337,12 @@ class OVHApi:
     async def get_server_details(self, server_id):
         """Get details of a specific server"""
         self._validate_server_id(server_id)
-        return await self._make_request('GET', f'/dedicated/server/{server_id}')
+        return await self._make_request("GET", f"/dedicated/server/{server_id}")
 
     async def get_server_ips(self, server_id):
         """Get ips of a specific server"""
         self._validate_server_id(server_id)
-        return await self._make_request('GET', f'/dedicated/server/{server_id}/ips')
+        return await self._make_request("GET", f"/dedicated/server/{server_id}/ips")
 
     async def list_servers_with_details(self):
         """List all servers with their details"""
@@ -353,20 +355,20 @@ class OVHApi:
             results = await gather(*tasks)
         except Exception as exc:
             raise CloudException(f"Error fetching server: {exc}") from exc
-        server_dict = {server_id: data for server_id, data in zip(server_ids, results[:len(server_ids)])}
-        for server_id, ip_data in zip(server_ids, results[len(server_ids):]):
+        server_dict = dict(zip(server_ids, results[: len(server_ids)], strict=False))
+        for server_id, ip_data in zip(server_ids, results[len(server_ids) :], strict=False):
             server_dict[server_id]["c4_aggregated_ips"] = ip_data
         return server_dict
 
     async def reinstall_server(self, server_name, ssh_key, operating_system="debian12_64"):
         self._validate_server_id(server_name)
         if not all(c in ALPHANUMERICAL_CHARS + ".- @/" for c in ssh_key):
-            raise CloudException(f"Invalid ssh key")
+            raise CloudException("Invalid ssh key")
         reinstall_body = {
             "operatingSystem": operating_system,
             "customizations": {"sshKey": ssh_key},
         }
-        return await self._make_request('POST', f'/dedicated/server/{server_name}/reinstall', reinstall_body)
+        return await self._make_request("POST", f"/dedicated/server/{server_name}/reinstall", reinstall_body)
 
     async def monitor_server_reinstallation(self, server_name):
         self._validate_server_id(server_name)
@@ -376,19 +378,19 @@ class OVHApi:
 
     async def list_ssh_keys(self):
         """List all SSH keys in your OVH account"""
-        ssh_key_names = await self._make_request('GET', '/me/sshKey')
+        ssh_key_names = await self._make_request("GET", "/me/sshKey")
         if any(not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in key_name) for key_name in ssh_key_names):
-            raise CloudException(f"Invalid ssh key name")
-        results = await gather(*(self._make_request('GET', f'/me/sshKey/{key_name}') for key_name in ssh_key_names))
-        return dict(zip(ssh_key_names, results))
+            raise CloudException("Invalid ssh key name")
+        results = await gather(*(self._make_request("GET", f"/me/sshKey/{key_name}") for key_name in ssh_key_names))
+        return dict(zip(ssh_key_names, results, strict=False))
 
     async def add_ssh_key(self, name, key):
         """Add an ssh key to your OVH account"""
         if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in name):
-            raise CloudException(f"Invalid ssh key name")
+            raise CloudException("Invalid ssh key name")
         if not all(c in ALPHANUMERICAL_CHARS + ".-@ " for c in key):
-            raise CloudException(f"Invalid ssh key")
-        return await self._make_request('POST', '/me/sshKey', {"keyName": name, "key": key})
+            raise CloudException("Invalid ssh key")
+        return await self._make_request("POST", "/me/sshKey", {"keyName": name, "key": key})
 
     # Domains
 
@@ -402,7 +404,7 @@ class OVHApi:
 
     async def list_domain(self):
         """List all domains"""
-        response = await self._make_request('GET', '/domain')
+        response = await self._make_request("GET", "/domain")
         if type(response) is not list or any(type(item) is not str for item in response):
             raise CloudException("Invalid domain list")
         return response
@@ -420,13 +422,19 @@ class OVHApi:
             self._make_request("GET", f"/domain/{domain}/glueRecord"),  # Glue records if any
         )
         tasks_keys = (
-            "basic", "service_infos", "record_ids", "name_server_ids", "option", "configurations_optin", "glue_record"
+            "basic",
+            "service_infos",
+            "record_ids",
+            "name_server_ids",
+            "option",
+            "configurations_optin",
+            "glue_record",
         )
         try:
             results = await gather(*tasks)
         except Exception as exc:
             raise CloudException(f"Error fetching domain data: {exc}") from exc
-        infos = {k: v for k, v in zip(tasks_keys, results)}
+        infos = dict(zip(tasks_keys, results, strict=False))
         if any(type(id_) is not int for id_ in infos["record_ids"]):
             raise CloudException("Invalid record id")
         if any(type(id_) is not int for id_ in infos["name_server_ids"]):
@@ -438,10 +446,12 @@ class OVHApi:
             )
         except Exception as exc:
             raise CloudException(f"Error fetching domain data: {exc}") from exc
-        infos["records"] = {k: v for k, v in zip(infos["record_ids"], additional_results[0:len(infos["record_ids"])])}
-        infos["name_servers"] = {
-            k: v for k, v in zip(infos["name_server_ids"], additional_results[len(infos["record_ids"]):])
-        }
+        infos["records"] = dict(
+            zip(infos["record_ids"], additional_results[0 : len(infos["record_ids"])], strict=False)
+        )
+        infos["name_servers"] = dict(
+            zip(infos["name_server_ids"], additional_results[len(infos["record_ids"]) :], strict=False)
+        )
         return infos
 
     async def domain_refresh(self, domain):
@@ -456,14 +466,14 @@ class OVHApi:
 
     async def domain_add_record(self, domain, field_type, sub_domain, target, ttl):
         self._validate_domain(domain)
-        record = {'fieldType': str(field_type), 'subDomain': str(sub_domain), 'target': str(target), 'ttl': int(ttl)}
+        record = {"fieldType": str(field_type), "subDomain": str(sub_domain), "target": str(target), "ttl": int(ttl)}
         return await self._make_request("POST", f"/domain/zone/{domain}/record", record)
 
     async def domain_update_record(self, domain, record_id, field_type=None, sub_domain=None, target=None, ttl=None):
         """Uses POST to /record (not PUT to /record/{record_id}) — worked when last tested, OVH API may not support PUT"""
         self._validate_domain(domain)
         self._validate_record_id(record_id)
-        record = {'fieldType': field_type, 'subDomain': sub_domain, 'target': target, 'ttl': ttl}
+        record = {"fieldType": field_type, "subDomain": sub_domain, "target": target, "ttl": ttl}
         record = {k: str(v) if k != "ttl" else int(v) for k, v in record.items() if v is not None}
         return await self._make_request("POST", f"/domain/zone/{domain}/record", record)
 
@@ -505,12 +515,16 @@ class OVHApi:
         self._validate_cart_id(cart_id)
         if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in domain_name):
             raise CloudException("Invalid domain name")
-        return await self._make_request("POST", f"/order/cart/{cart_id}/domain", {
-            "domain": domain_name,
-            "duration": "P1Y",  # 1 year
-            # "duration": "P2Y",  # 2 year  # should parameterize
-            "offerId": "domain_offer_id"
-        })
+        return await self._make_request(
+            "POST",
+            f"/order/cart/{cart_id}/domain",
+            {
+                "domain": domain_name,
+                "duration": "P1Y",  # 1 year
+                # "duration": "P2Y",  # 2 year  # should parameterize
+                "offerId": "domain_offer_id",
+            },
+        )
 
     # Emails
 
@@ -523,62 +537,60 @@ class OVHApi:
             raise CloudException("Invalid email account name")
 
     async def list_all_email_domains(self):
-        return await self._make_request('GET', '/email/domain')
+        return await self._make_request("GET", "/email/domain")
 
     async def get_details_for_a_specific_domain(self, domain_name):
         self._validate_email_domain_name(domain_name)
-        return await self._make_request('GET', f'/email/domain/{domain_name}')
+        return await self._make_request("GET", f"/email/domain/{domain_name}")
 
     async def list_email_accounts_for_a_domain(self, domain_name):
         self._validate_email_domain_name(domain_name)
-        return await self._make_request('GET', f'/email/domain/{domain_name}/account')
+        return await self._make_request("GET", f"/email/domain/{domain_name}/account")
 
     async def get_account_details(self, domain_name, account_name):
         """account_name of the form user"""
         self._validate_email_domain_name(domain_name)
         self._validate_email_account_name(account_name)
-        return await self._make_request('GET', f'/email/domain/{domain_name}/account/{account_name}')
+        return await self._make_request("GET", f"/email/domain/{domain_name}/account/{account_name}")
 
     async def create_a_new_email_account(self, domain_name, account_name, password, description, size):
         """size is in bytes"""
         self._validate_email_domain_name(domain_name)
         self._validate_email_account_name(account_name)
-        new_account_data = {
-            "accountName": account_name, "password": password, "description": description, "size": size
-        }
-        return await self._make_request('POST', f'/email/domain/{domain_name}/account', new_account_data)
+        new_account_data = {"accountName": account_name, "password": password, "description": description, "size": size}
+        return await self._make_request("POST", f"/email/domain/{domain_name}/account", new_account_data)
 
     async def update_account_quota(self, domain_name, account_name, size):
         self._validate_email_domain_name(domain_name)
         self._validate_email_account_name(account_name)
         update_data = {"size": size}  # in bytes
-        return await self._make_request('PUT', f'/email/domain/{domain_name}/account/{account_name}', update_data)
+        return await self._make_request("PUT", f"/email/domain/{domain_name}/account/{account_name}", update_data)
 
     async def delete_an_email_account(self, domain_name, account_name):
         self._validate_email_domain_name(domain_name)
         self._validate_email_account_name(account_name)
-        return await self._make_request('DELETE', f'/email/domain/{domain_name}/account/{account_name}')
+        return await self._make_request("DELETE", f"/email/domain/{domain_name}/account/{account_name}")
 
     async def list_email_redirections(self, domain_name):
         self._validate_email_domain_name(domain_name)
-        return await self._make_request('GET', f'/email/domain/{domain_name}/redirection')
+        return await self._make_request("GET", f"/email/domain/{domain_name}/redirection")
 
     async def create_a_redirection(self, domain_name, email_from, email_to, local_copy):
         self._validate_email_domain_name(domain_name)
-        redirection_data = { "from": email_from, "to": email_to, "localCopy": local_copy }
-        return await self._make_request('POST', f'/email/domain/{domain_name}/redirection', redirection_data)
+        redirection_data = {"from": email_from, "to": email_to, "localCopy": local_copy}
+        return await self._make_request("POST", f"/email/domain/{domain_name}/redirection", redirection_data)
 
     async def check_domain_quota_usage(self, domain_name):
         self._validate_email_domain_name(domain_name)
-        return await self._make_request('GET', f'/email/domain/{domain_name}/quota')
+        return await self._make_request("GET", f"/email/domain/{domain_name}/quota")
 
     async def get_service_information(self, domain_name):
         self._validate_email_domain_name(domain_name)
-        return await self._make_request('GET', f'/email/domain/{domain_name}/serviceInfos')
+        return await self._make_request("GET", f"/email/domain/{domain_name}/serviceInfos")
 
     async def check_if_you_can_order_additional_resources(self, domain_name):
         self._validate_email_domain_name(domain_name)
-        return await self._make_request('GET', f'/email/domain/{domain_name}/availableOffer')
+        return await self._make_request("GET", f"/email/domain/{domain_name}/availableOffer")
 
     # Telephony Voicemail
 
@@ -592,7 +604,7 @@ class OVHApi:
 
     async def list_telephony_services(self):
         """List all telephony services (billing accounts)"""
-        billing_accounts = await self._make_request('GET', '/telephony')
+        billing_accounts = await self._make_request("GET", "/telephony")
         if any(not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in account) for account in billing_accounts):
             raise CloudException("Invalid billing account")
         return billing_accounts
@@ -600,7 +612,7 @@ class OVHApi:
     async def list_voicemail_services(self, billing_account):
         """List all voicemail services for a billing account"""
         self._validate_billing_account(billing_account)
-        services = await self._make_request('GET', f'/telephony/{billing_account}/voicemail')
+        services = await self._make_request("GET", f"/telephony/{billing_account}/voicemail")
         if any(not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in service) for service in services):
             raise CloudException("Invalid voicemail service")
         return services
@@ -609,7 +621,7 @@ class OVHApi:
         """List all voicemail messages (directories)"""
         self._validate_billing_account(billing_account)
         self._validate_service_name(service_name)
-        messages = await self._make_request('GET', f'/telephony/{billing_account}/voicemail/{service_name}/directories')
+        messages = await self._make_request("GET", f"/telephony/{billing_account}/voicemail/{service_name}/directories")
         return messages
 
     async def get_voicemail_message_details(self, billing_account, service_name, message_id):
@@ -619,8 +631,10 @@ class OVHApi:
         try:
             message_id = int(message_id)
         except ValueError:
-            raise CloudException("Message ID must be an integer")
-        return await self._make_request('GET', f'/telephony/{billing_account}/voicemail/{service_name}/directories/{message_id}')
+            raise CloudException("Message ID must be an integer") from None
+        return await self._make_request(
+            "GET", f"/telephony/{billing_account}/voicemail/{service_name}/directories/{message_id}"
+        )
 
     async def download_voicemail_message(self, billing_account, service_name, message_id, audio_format="wav"):
         """Download a voicemail message"""
@@ -629,15 +643,15 @@ class OVHApi:
         try:
             message_id = int(message_id)
         except ValueError:
-            raise CloudException("Message ID must be an integer")
+            raise CloudException("Message ID must be an integer") from None
         if audio_format not in ["wav", "mp3"]:
             raise CloudException("Audio format must be 'wav' or 'mp3'")
         return await self._make_request(
-            'GET',
-            f'/telephony/{billing_account}/voicemail/{service_name}/directories/{message_id}/download',
+            "GET",
+            f"/telephony/{billing_account}/voicemail/{service_name}/directories/{message_id}/download",
             data={"format": audio_format},
             decode_json=False,
-            decode_utf8=False
+            decode_utf8=False,
         )
 
     async def download_voicemail_greeting(self, billing_account, service_name, greeting_id, audio_format="wav"):
@@ -647,22 +661,22 @@ class OVHApi:
         try:
             greeting_id = int(greeting_id)
         except ValueError:
-            raise CloudException("Greeting ID must be an integer")
+            raise CloudException("Greeting ID must be an integer") from None
         if audio_format not in ["wav", "mp3"]:
             raise CloudException("Audio format must be 'wav' or 'mp3'")
         return await self._make_request(
-            'GET',
-            f'/telephony/{billing_account}/voicemail/{service_name}/greetings/{greeting_id}/download',
+            "GET",
+            f"/telephony/{billing_account}/voicemail/{service_name}/greetings/{greeting_id}/download",
             data={"format": audio_format},
             decode_json=False,
-            decode_utf8=False
+            decode_utf8=False,
         )
 
     async def get_voicemail_settings(self, billing_account, service_name):
         """Get voicemail settings"""
         self._validate_billing_account(billing_account)
         self._validate_service_name(service_name)
-        return await self._make_request('GET', f'/telephony/{billing_account}/voicemail/{service_name}/settings')
+        return await self._make_request("GET", f"/telephony/{billing_account}/voicemail/{service_name}/settings")
 
     # Orders
 
@@ -671,11 +685,11 @@ class OVHApi:
             raise CloudException("Invalid order id")
 
     async def list_orders(self):
-        orders = await self._make_request("GET", f"/me/order")
+        orders = await self._make_request("GET", "/me/order")
         for order in orders:
             self._validate_order_id(order)
         results = await gather(*(self._make_request("GET", f"/me/order/{order}") for order in orders))
-        return dict(zip(orders, results))
+        return dict(zip(orders, results, strict=False))
 
     async def pay_order(self, order_id, payment_method_id):
         """WARNING only handles credit cards for now - AND NEVER WORKED FOR DOMAINS!"""
@@ -691,11 +705,11 @@ class OVHApi:
     # Payment methods
 
     async def get_payment_methods(self):
-        methods = await self._make_request("GET", f"/me/payment/method")
-        if not type(methods) is list or any(type(v) is not int for v in methods):
+        methods = await self._make_request("GET", "/me/payment/method")
+        if type(methods) is not list or any(type(v) is not int for v in methods):
             raise CloudException(f"Unexpected return value for /me/payment/method: {methods}")
         results = await gather(*(self._make_request("GET", f"/me/payment/method/{k}") for k in methods))
-        return dict(zip(methods, results))
+        return dict(zip(methods, results, strict=False))
 
 
 ########################################################################################################################
@@ -716,29 +730,20 @@ class ScalewayApi:
         query = self.base_url + path
         # Prepare body
         body = ""
-        headers = {
-            'X-Auth-Token': self.secret_key,
-            'Content-Type': 'application/json'
-        }
+        headers = {"X-Auth-Token": self.secret_key, "Content-Type": "application/json"}
         if data:
             body = dumps(data)
-            headers['Content-Length'] = str(len(body))
+            headers["Content-Length"] = str(len(body))
         # Create request
         return await make_request(
-            self.cert_checksum,
-            method,
-            query,
-            body,
-            headers,
-            decode_json=decode_json,
-            decode_utf8=decode_utf8
+            self.cert_checksum, method, query, body, headers, decode_json=decode_json, decode_utf8=decode_utf8
         )
 
     # Invoices
 
     async def list_invoices(self):
         """List all invoices"""
-        invoices_data = await self._make_request('GET', '/billing/v2beta1/invoices')
+        invoices_data = await self._make_request("GET", "/billing/v2beta1/invoices")
         invoices_data_list = invoices_data["invoices"]
         if any(not all(c in "0123456789abcdef-" for c in invoice["id"]) for invoice in invoices_data_list):
             raise CloudException("Invalid invoice id")
@@ -754,8 +759,8 @@ class ScalewayApi:
             raise CloudException(f"Invalid invoice name {r['name']}")
         try:
             bytes_content = b64decode(r["content"])
-        except Exception as exc:
-            raise CloudException("Unable to b64decode invoice pdf content")
+        except Exception:
+            raise CloudException("Unable to b64decode invoice pdf content") from None
         return r["name"], bytes_content
 
     # Servers
@@ -816,7 +821,9 @@ class CloudConfig:
             raise CloudException(f"Unexpected certificate format for {self.name} certificate {self.certificate}")
         if self.invoice_path is not None:
             if "{year}" not in self.invoice_path or "{invoice_id}" not in self.invoice_path:
-                raise CloudException(f"{self.name} 'invoice-path' must contain {{year}} and {{invoice_id}} placeholders")
+                raise CloudException(
+                    f"{self.name} 'invoice-path' must contain {{year}} and {{invoice_id}} placeholders"
+                )
 
 
 class OVHConfig(CloudConfig):
@@ -838,8 +845,8 @@ def load_config():
         return None
     try:
         config_dict = loads(config_content)
-    except Exception as exc:
-        raise CloudException("Unable to parse config file as json")
+    except Exception:
+        raise CloudException("Unable to parse config file as json") from None
     if "ssl-cafile" not in config_dict or type(config_dict["ssl-cafile"]) is not str:
         raise CloudException("Missing or invalid 'ssl-cafile' in config")
     CAFILE = config_dict["ssl-cafile"]
@@ -852,14 +859,14 @@ def load_config():
 
 def usage(wrong_config=False):
     output_lines = [
-        f"cloud - KISS clouds bridge to your terminal",
-        f"───────────────────────────────────────────",
-        f"""~/.config/cloud/config.json => {{"ssl-cafile": "/path/to/cacert.pem",""",
-        f"""                                "ovh": {{...}}, "scaleway": {{...}}}}""",
-        f"───────────────────────────────────────────",
-        f"You can set /* for any verb when generating your OVH api key",
-        f"───────────────────────────────────────────",
-        f"""""",
+        "cloud - KISS clouds bridge to your terminal",
+        "───────────────────────────────────────────",
+        """~/.config/cloud/config.json => {"ssl-cafile": "/path/to/cacert.pem",""",
+        """                                "ovh": {...}, "scaleway": {...}}""",
+        "───────────────────────────────────────────",
+        "You can set /* for any verb when generating your OVH api key",
+        "───────────────────────────────────────────",
+        """""",
         f"""{Color.PURP.value}You must select a cloud first""",
         f"""{Color.DIM.value} - {Color.WHITE.value}cloud ovh""",
         f"""{Color.DIM.value} - {Color.WHITE.value}cloud scaleway""",
@@ -877,7 +884,7 @@ def consume_parameters(args, mandatories=None, optionals=None):
         raise CloudException(f"Missing mandatory parameters: {missing_mandatories}")
     return (
         [a for a in args if not any(a.startswith(f"{p}=") for p in (*mandatories, *optionals))],
-        {a[:len(n)]: a[len(n)+1:] for a in args for n in (*mandatories, *optionals) if a.startswith(f"{n}=")},
+        {a[: len(n)]: a[len(n) + 1 :] for a in args for n in (*mandatories, *optionals) if a.startswith(f"{n}=")},
     )
 
 
@@ -888,17 +895,17 @@ async def ovh_invoice(ovh_api, ovh_config):
     downloaded_count = 0
     for invoice_id, invoice in invoices.items():
         if not isinstance(invoice.get("date"), str):
-            raise CloudException(f"Can't find date as str for invoice")
+            raise CloudException("Can't find date as str for invoice")
         if not all(c in "0123456789-" for c in invoice["date"][:10]):
-            raise CloudException(f"Invalid date for invoice")
+            raise CloudException("Invalid date for invoice")
         if not isinstance(invoice.get("priceWithTax"), dict):
-            raise CloudException(f"Invalid priceWithTax infos for invoice")
+            raise CloudException("Invalid priceWithTax infos for invoice")
         value = invoice["priceWithTax"].get("value")
-        if not type(value) is int and not type(value) is float:
+        if type(value) is not int and type(value) is not float:
             raise CloudException(f"Invalid priceWithTax value type {type(value)} for invoice")
         value = f"{value:.2f}"
         if type(invoice["date"]) is not str:
-            raise CloudException(f"Invalid type for date of invoice")
+            raise CloudException("Invalid type for date of invoice")
         printable_date = invoice["date"][:10]
         if not all(c in "0123456789-" for c in printable_date):
             raise CloudException(f"Unexpected date format for invoice {invoice_id}: {invoice['date']}")
@@ -930,13 +937,14 @@ async def ovh_invoice(ovh_api, ovh_config):
             downloaded_count += 1
     print(f"Downloaded {downloaded_count}/{len(invoices)} invoices")
 
+
 async def ovh_vps_list(ovh_api):
     vps_dict = await ovh_api.list_vps_with_details()
     for vps_id, vps_data in vps_dict.items():
         service_infos = vps_data.get("c4_aggregated_service_infos", {})
         renew_infos = service_infos.get("renew", {})
-        will_renew = (
-            (renew_infos.get("automatic") and not renew_infos.get("deleteAtExpiration")) or renew_infos.get("forced")
+        will_renew = (renew_infos.get("automatic") and not renew_infos.get("deleteAtExpiration")) or renew_infos.get(
+            "forced"
         )
         inconsistent_renew_infos = (
             not renew_infos  # indirectly checks that service_infos is not {}
@@ -962,7 +970,7 @@ async def ovh_vps_list(ovh_api):
         )
         print(vps_data.get("c4_aggregated_ips", ""))
         # pretty_print(vps_data)
-        print("")
+        print()
 
 
 async def ovh_vps_reinstall(ovh_api, vps_id, ssh_key):
@@ -973,7 +981,7 @@ async def ovh_vps_reinstall(ovh_api, vps_id, ssh_key):
     )
     confirm(f"Will wipe vps {vps_id}. ")
     response = await ovh_api.reinstall_vps(vps_id, ssh_key)
-    if not type(response) is dict:
+    if type(response) is not dict:
         print(f"{Color.RED.value}WARNING: UNEXPECTED RESPONSE TYPE{Color.WHITE.value}")
         print(response)
         return
@@ -1011,8 +1019,7 @@ async def ovh_servers(ovh_api):
         print(f"{server_id}: {server_data.get('displayName')}")
         print(f"{server_data.get('commercialRange', 'UNKNOWN')}")
         print(server_data.get("c4_aggregated_ips", ""))
-        print("")
-
+        print()
 
 
 async def ovh_servers_reinstall(ovh_api, server_name, ssh_key):
@@ -1023,7 +1030,7 @@ async def ovh_servers_reinstall(ovh_api, server_name, ssh_key):
     )
     confirm(f"Will wipe server {server_name}. ")
     response = await ovh_api.reinstall_server(server_name, ssh_key)
-    if not type(response) is dict:
+    if type(response) is not dict:
         print(f"{Color.RED.value}WARNING: UNEXPECTED RESPONSE TYPE{Color.WHITE.value}")
         print(response)
         return
@@ -1052,7 +1059,7 @@ async def ovh_servers_monitor_reinstall(ovh_api, server_name):
             "todo": f"{Color.DIM.value}{status}{Color.WHITE.value}",
         }.get(status, f"{Color.RED.value}{status}{Color.WHITE.value}").ljust(16)
         error = f"{Color.RED.value}{progress_element.get('error', '')}{Color.WHITE.value}"
-        print(f"  {status} {error} {progress_element.get('comment', '')} {unhandled_part if unhandled_part else ''}")
+        print(f"  {status} {error} {progress_element.get('comment', '')} {unhandled_part or ''}")
     for key, data in {k: v for k, v in response.items() if k not in ["elapsedTime", "progress"]}.items():
         print(f"{Color.RED.value}WARNING: UNHANDLED KEY {key} ={Color.WHITE.value} {data}")
 
@@ -1067,7 +1074,6 @@ async def ovh_ssh_keys(ovh_api, args):
         pretty_print(await ovh_api.add_ssh_key(args[1], args[2]))
         return
     print("cloud ovh ssh-key list\ncloud ovh ssh-key add name key")
-
 
 
 async def ovh_domain(ovh_api, args):
@@ -1103,7 +1109,7 @@ async def ovh_domain(ovh_api, args):
                 f"[{Color.PURP.value}{record['zone']}{Color.DIM.value}]"
                 f"[target={Color.GREEN.value}{record['target']}{Color.DIM.value}]"
                 f"[ttl={Color.GREEN.value}{record['ttl']}{Color.DIM.value}]"
-                f"{Color.WHITE.value}{clean_record if clean_record else ''}"
+                f"{Color.WHITE.value}{clean_record or ''}"
             )
         return
     if len(args) == 4 and args[0] == "zone" and args[2] == "get":
@@ -1120,9 +1126,11 @@ async def ovh_domain(ovh_api, args):
         await refresh_zone(args[1])
         return
     if len(args) > 2 and args[0] == "zone" and args[2] == "edit":
-        nargs, optionals = consume_parameters(args[3:], mandatories=["field-type", "target"], optionals=["sub-domain", "ttl"])
+        nargs, optionals = consume_parameters(
+            args[3:], mandatories=["field-type", "target"], optionals=["sub-domain", "ttl"]
+        )
         if len(nargs) == 0:
-            raise CloudException(f"Specify the zone to edit")
+            raise CloudException("Specify the zone to edit")
         if len(nargs) > 1:
             raise CloudException(f"Found unknown parameter: {nargs}")
         print(f"  {Color.RED.value}!! WARNING this created a new zone, delete previous manually !!{Color.WHITE.value}")
@@ -1148,6 +1156,7 @@ async def ovh_domain(ovh_api, args):
         f"{baseline}zone my.domain.ovh add field-type=... sub-domain=... target=... ttl=...\n"
         f"{baseline}zone my.domain.ovh edit [field-type=...] [sub-domain=...] [target=...] [ttl=...]\n"
     )
+
 
 async def ovh_email(ovh_api, args):
     if len(args) == 1 and args[0] == "list":
@@ -1197,7 +1206,8 @@ async def ovh_email(ovh_api, args):
     ]
     DIM, WHITE, PURP = Color.DIM.value, Color.WHITE.value, Color.PURP.value
     print(
-        "HELP\n" + "\n".join(
+        "HELP\n"
+        + "\n".join(
             f" {DIM}- {PURP}cloud ovh email {WHITE}{name}{PURP}{arguments}{DIM} - {description}"
             for name, arguments, description in help_list
         )
@@ -1240,7 +1250,7 @@ async def ovh_telephony(ovh_api, args):
         audio_data = await ovh_api.download_voicemail_message(args[1], args[2], args[3], audio_format)
         filename = f"voicemail_{args[1]}_{args[2]}_{args[3]}.{audio_format}"
 
-        with open(filename, "wb") as f:
+        with Path(filename).open("wb") as f:
             f.write(audio_data)
 
         print(f"{Color.GREEN.value}Downloaded voicemail message to {filename}{Color.WHITE.value}")
@@ -1254,7 +1264,7 @@ async def ovh_telephony(ovh_api, args):
         audio_data = await ovh_api.download_voicemail_greeting(args[1], args[2], args[3], audio_format)
         filename = f"greeting_{args[1]}_{args[2]}_{args[3]}.{audio_format}"
 
-        with open(filename, "wb") as f:
+        with Path(filename).open("wb") as f:
             f.write(audio_data)
 
         print(f"{Color.GREEN.value}Downloaded voicemail greeting to {filename}{Color.WHITE.value}")
@@ -1283,20 +1293,24 @@ async def ovh_telephony(ovh_api, args):
 async def ovh_buy(ovh_api, args):
     def buy_usage():
         options = [
-            f"start description",
-            f"assign cart-id",
-            f"cancel cart-id",
-            f"view cart-id",
+            "start description",
+            "assign cart-id",
+            "cancel cart-id",
+            "view cart-id",
             f"checkout cart-id  {Color.DIM.value}# you must pay after checkout, see orders{Color.WHITE.value}",
-            f"─",
-            f"add cart-id domain domain.ovh",
+            "─",
+            "add cart-id domain domain.ovh",
         ]
-        print("\n" + "\n".join(
-            "─" * 40
-            if option == "─"
-            else f"{Color.DIM.value}- {Color.WHITE.value}cloud ovh buy {option}" for option in options) + "\n"
+        print(
+            "\n"
+            + "\n".join(
+                "─" * 40 if option == "─" else f"{Color.DIM.value}- {Color.WHITE.value}cloud ovh buy {option}"
+                for option in options
+            )
+            + "\n"
         )
         return -1
+
     # Start
     if len(args) == 2 and args[0] == "start":
         return await ovh_api.create_cart(args[1])
@@ -1348,6 +1362,7 @@ async def ovh_payment(ovh_api, args):
     pretty_print(await ovh_api.get_payment_methods())
     return
 
+
 async def scaleway_domain(scaleway_api, args):
     if args == ["list"]:
         pretty_print(await scaleway_api.list_domains())
@@ -1357,16 +1372,17 @@ async def scaleway_domain(scaleway_api, args):
         return
     print("- cloud scaleway domain list\n- cloud scaleway domain get project_id")
 
+
 async def scaleway_invoice(scaleway_api, scaleway_config):
     if not scaleway_config.invoice_path:
         raise CloudException("Missing 'invoice-path' in Scaleway config (use {year} and {invoice_id} placeholders)")
     invoices = await scaleway_api.list_invoices()
     downloaded_count = 0
     for invoice in invoices:
-        invoice_id = invoice['id']
-        if type(invoice['issued_date']) != str:
+        invoice_id = invoice["id"]
+        if not isinstance(invoice["issued_date"], str):
             raise CloudException(f"Invalid type for date of invoice {invoice_id}")
-        invoice_short_date = invoice['issued_date'][:10]
+        invoice_short_date = invoice["issued_date"][:10]
         invoice_year = invoice_short_date[:4]
         if len(invoice_year) != 4 or not all(c in "0123456789" for c in invoice_year):
             raise CloudException(f"Unexpected date format for invoice {invoice_id}: {invoice['issued_date']}")
@@ -1463,12 +1479,12 @@ async def main():
         if len(argv) > 2 and argv[2] == "telephony":
             return await ovh_telephony(ovh_api, argv[3:])
         help_items = [
-            f"ovh vps",
-            f"ovh invoice",
-            f"ovh dedicated-server",
-            f"ovh ssh-key",
-            f"ovh domain",
-            f"ovh email",
+            "ovh vps",
+            "ovh invoice",
+            "ovh dedicated-server",
+            "ovh ssh-key",
+            "ovh domain",
+            "ovh email",
             f"ovh telephony {Color.DIM.value}# voicemail messages{Color.WHITE.value}",
             f"ovh buy       {Color.DIM.value}# manage carts{Color.WHITE.value}",
             f"ovh orders    {Color.DIM.value}# manage orders (checked out carts have to be paid with this)",
@@ -1491,13 +1507,14 @@ async def main():
             print("cloud scaleway server remove {server_id}     === Makes a delete - ?")
             return
         help_items = [
-            f"scaleway domain",
-            f"scaleway server",
-            f"scaleway invoice",
+            "scaleway domain",
+            "scaleway server",
+            "scaleway invoice",
         ]
     print(
         f"\n{Color.PURP.value}Select a category{Color.WHITE.value}\n"
-        + "\n".join(f"{Color.DIM.value} - {Color.WHITE.value}cloud {item}" for item in help_items) + "\n"
+        + "\n".join(f"{Color.DIM.value} - {Color.WHITE.value}cloud {item}" for item in help_items)
+        + "\n"
     )
 
 
