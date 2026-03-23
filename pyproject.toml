@@ -1,0 +1,47 @@
+[project]
+name = "cloud"
+version = "0.0.1"
+authors = [
+  { name = "c4ffein" },
+]
+description = "KISS cli to interact with french cloud providers (OVH + Scaleway)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+
+[project.urls]
+Homepage = "https://github.com/c4ffein/cloud"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15",
+    "ty>=0.0.24",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "B",    # flake8-bugbear
+    "C",    # flake8-comprehensions
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "FURB", # refurb
+    "I",    # isort
+    "PTH",  # flake8-use-pathlib
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+]
+
+[tool.ruff.lint.per-file-ignores]
+"cloud.py" = ["C901"]  # No complexity check on single-file project
+
+[tool.ty.rules]
+unresolved-import = "ignore"       # ssl._ssl is a private C extension module
+unresolved-attribute = "ignore"    # CloudConfig uses dynamic setattr from config dict
+invalid-argument-type = "ignore"   # openssl_sha256 argument type is correct at runtime
+
+[tool.ty.environment]
+python-version = "3.10"
