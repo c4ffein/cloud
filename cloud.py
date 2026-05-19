@@ -1064,6 +1064,18 @@ async def ovh_servers_monitor_reinstall(ovh_api, server_name):
         print(f"{Color.RED.value}WARNING: UNHANDLED KEY {key} ={Color.WHITE.value} {data}")
 
 
+async def ovh_dedicated_server(ovh_api, args):
+    if len(args) == 2 and args[0] == "monitor-reinstall":
+        return await ovh_servers_monitor_reinstall(ovh_api, args[1])
+    if len(args) == 3 and args[0] == "reinstall":
+        return await ovh_servers_reinstall(ovh_api, args[1], args[2])
+    if len(args) == 0:
+        return await ovh_servers(ovh_api)
+    print("cloud ovh dedicated-server")
+    print("cloud ovh dedicated-server reinstall XXX SSH_KEY")  # SSH_KEY not name
+    print("cloud ovh dedicated-server monitor-reinstall XXX")
+
+
 async def ovh_ssh_keys(ovh_api, args):
     if args == ["list"]:
         ssh_keys_dict = await ovh_api.list_ssh_keys()
@@ -1429,11 +1441,22 @@ async def scaleway_terminate_server(scaleway_api, server_id):
     print(response_dict)
 
 
+async def scaleway_server(scaleway_api, args):
+    if len(args) == 0:
+        return await scaleway_servers(scaleway_api)
+    if len(args) == 2 and args[0] == "terminate":
+        return await scaleway_terminate_server(scaleway_api, args[1])
+    if len(args) == 2 and args[0] == "remove":
+        return await scaleway_remove_server(scaleway_api, args[1])
+    print("cloud scaleway server")
+    print("cloud scaleway server terminate {server_id}  === Wipes attached storages")
+    print("cloud scaleway server remove {server_id}     === Makes a delete - ?")
+
+
 async def main():
     ovh_config, scaleway_config = load_config()
     if not ovh_config or not scaleway_config:
         return usage()  # TODO Better to show config
-    help_items = []  # will be populated by either scaleway or ovh main help
     ovh_api = OVHApi(
         cert_checksum=ovh_config.certificate,
         pdf_cert_checksum=ovh_config.pdf_certificate,
@@ -1446,74 +1469,46 @@ async def main():
         secret_key=scaleway_config.secret_key,
         organization_id=scaleway_config.organization_id,
     )
-    if len(argv) < 2 or argv[1] not in ["ovh", "scaleway"]:
-        return usage()
-    if argv[1] == "ovh":
-        if len(argv) > 2 and argv[2] == "invoice":
-            return await ovh_invoice(ovh_api, ovh_config)
-        if len(argv) > 2 and argv[2] == "vps":
-            return await ovh_vps(ovh_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "domain":
-            return await ovh_domain(ovh_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "email":
-            return await ovh_email(ovh_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "dedicated-server":
-            if len(argv) == 5 and argv[3] == "monitor-reinstall":
-                return await ovh_servers_monitor_reinstall(ovh_api, argv[4])
-            if len(argv) == 6 and argv[3] == "reinstall":
-                return await ovh_servers_reinstall(ovh_api, argv[4], argv[5])
-            if len(argv) == 3:
-                return await ovh_servers(ovh_api)
-            print("cloud ovh dedicated-server")
-            print("cloud ovh dedicated-server reinstall XXX SSH_KEY")  # SSH_KEY not name
-            print("cloud ovh dedicated-server monitor-reinstall XXX")
-            return
-        if len(argv) > 2 and argv[2] == "ssh-key":
-            return await ovh_ssh_keys(ovh_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "buy":
-            return await ovh_buy(ovh_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "orders":
-            return await ovh_orders(ovh_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "payment":
-            return await ovh_payment(ovh_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "telephony":
-            return await ovh_telephony(ovh_api, argv[3:])
-        help_items = [
-            "ovh vps",
-            "ovh invoice",
-            "ovh dedicated-server",
-            "ovh ssh-key",
-            "ovh domain",
-            "ovh email",
+    ovh_cmds = {
+        "vps": (lambda args: ovh_vps(ovh_api, args), "ovh vps"),
+        "invoice": (lambda args: ovh_invoice(ovh_api, ovh_config), "ovh invoice"),
+        "dedicated-server": (lambda args: ovh_dedicated_server(ovh_api, args), "ovh dedicated-server"),
+        "ssh-key": (lambda args: ovh_ssh_keys(ovh_api, args), "ovh ssh-key"),
+        "domain": (lambda args: ovh_domain(ovh_api, args), "ovh domain"),
+        "email": (lambda args: ovh_email(ovh_api, args), "ovh email"),
+        "telephony": (
+            lambda args: ovh_telephony(ovh_api, args),
             f"ovh telephony {Color.DIM.value}# voicemail messages{Color.WHITE.value}",
+        ),
+        "buy": (
+            lambda args: ovh_buy(ovh_api, args),
             f"ovh buy       {Color.DIM.value}# manage carts{Color.WHITE.value}",
+        ),
+        "orders": (
+            lambda args: ovh_orders(ovh_api, args),
             f"ovh orders    {Color.DIM.value}# manage orders (checked out carts have to be paid with this)",
+        ),
+        "payment": (
+            lambda args: ovh_payment(ovh_api, args),
             f"ovh payment   {Color.DIM.value}# list payment methods{Color.WHITE.value}",
-        ]
-    else:
-        if len(argv) > 2 and argv[2] == "invoice":
-            return await scaleway_invoice(scaleway_api, scaleway_config)
-        if len(argv) > 2 and argv[2] == "domain":
-            return await scaleway_domain(scaleway_api, argv[3:])
-        if len(argv) > 2 and argv[2] == "server":
-            if len(argv) == 3:
-                return await scaleway_servers(scaleway_api)
-            if len(argv) == 5 and argv[3] == "terminate":
-                return await scaleway_terminate_server(scaleway_api, argv[4])
-            if len(argv) == 5 and argv[3] == "remove":
-                return await scaleway_remove_server(scaleway_api, argv[4])
-            print("cloud scaleway server")
-            print("cloud scaleway server terminate {server_id}  === Wipes attached storages")
-            print("cloud scaleway server remove {server_id}     === Makes a delete - ?")
-            return
-        help_items = [
-            "scaleway domain",
-            "scaleway server",
-            "scaleway invoice",
-        ]
+        ),
+    }
+    scaleway_cmds = {
+        "domain": (lambda args: scaleway_domain(scaleway_api, args), "scaleway domain"),
+        "server": (lambda args: scaleway_server(scaleway_api, args), "scaleway server"),
+        "invoice": (lambda args: scaleway_invoice(scaleway_api, scaleway_config), "scaleway invoice"),
+    }
+    providers = {"ovh": ovh_cmds, "scaleway": scaleway_cmds}
+
+    if len(argv) < 2 or argv[1] not in providers:
+        return usage()
+    cmds = providers[argv[1]]
+    if len(argv) > 2 and argv[2] in cmds:
+        handler, _ = cmds[argv[2]]
+        return await handler(argv[3:])
     print(
         f"\n{Color.PURP.value}Select a category{Color.WHITE.value}\n"
-        + "\n".join(f"{Color.DIM.value} - {Color.WHITE.value}cloud {item}" for item in help_items)
+        + "\n".join(f"{Color.DIM.value} - {Color.WHITE.value}cloud {label}" for _, label in cmds.values())
         + "\n"
     )
 
