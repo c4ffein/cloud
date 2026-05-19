@@ -1109,11 +1109,25 @@ async def ovh_domain(ovh_api, args):
         return
     if len(args) == 2 and args[0] == "info":
         response = await ovh_api.info_domain(args[1])
-        handled_basics = ["domain", "contactAdmin", "contactBilling", "contactOwner", "contactTech"]
+        handled_basics = ["domain", "contactAdmin", "contactBilling", "contactOwner", "contactTech", "nameServers"]
         basic_dict = response["basic"]
         print(f"{Color.GREEN.value}{basic_dict['domain']}{Color.DIM.value}")
         contact_keys = ["contactAdmin", "contactBilling", "contactOwner", "contactTech"]
         print({k: v for k, v in basic_dict.items() if k in contact_keys})
+        if type(basic_dict.get("nameServers")) is not list:
+            pretty_print(basic_dict.get("nameServers"))
+        else:
+            print(f"{Color.PURP.value}name servers{Color.DIM.value}")
+            for line in basic_dict.get("nameServers"):
+                if set(line.keys()) != {"id", "nameServer", "nameServerType"}:
+                    pretty_print(line)
+                else:
+                    print(
+                        f"  id {Color.PURP.value}{str(line.get('id')).ljust(20)}{Color.DIM.value}"
+                        f"  nameServer {Color.PURP.value}{str(line.get('nameServer')).ljust(20)}{Color.DIM.value}"
+                        f"  nameServerType {Color.PURP.value}{str(line.get('nameServerType')).ljust(20)}"
+                        f"{Color.DIM.value}"
+                    )
         pretty_print({k: v for k, v in basic_dict.items() if k not in handled_basics})
         print(f"{Color.GREEN.value}UNHANDLED INFOS{Color.DIM.value}")
         unhandled_domain_keys = ["basic", "record_ids", "name_server_ids", "records"]
