@@ -769,6 +769,13 @@ class ScalewayApi:
         print(f"{Color.RED.value}WARNING: ONLY CHECKING A SINGLE ZONE FOR NOW...{Color.WHITE.value}")
         return await self._make_request("GET", "/instance/v1/zones/fr-par-1/servers")
 
+    async def get_server(self, server_id):
+        server_id = server_id.lower()
+        if not all(c in "0123456789abcdef-" for c in server_id) or len(server_id) != 36:
+            raise CloudException("Invalid server id")
+        print(f"{Color.RED.value}WARNING: ONLY CHECKING A SINGLE ZONE FOR NOW...{Color.WHITE.value}")
+        return await self._make_request("GET", f"/instance/v1/zones/fr-par-1/servers/{server_id}")
+
     async def remove_server(self, server_id):
         server_id = server_id.lower()
         if not all(c in "0123456789abcdef-" for c in server_id) or len(server_id) != 36:
@@ -1428,6 +1435,75 @@ async def scaleway_servers(scaleway_api):
         print(f"{server.get('id', '')} - {server.get('name', '').ljust(30)} - {server.get('commercial_type', '')}")
 
 
+async def scaleway_server_infos(scaleway_api, server_id):
+    response = await scaleway_api.get_server(server_id)
+    if type(response) is not dict or type(response.get("server")) is not dict:
+        raise CloudException("Invalid data structure when fetching server")
+    server = response["server"]
+
+    def line(label, value):
+        print(f"  {Color.PURP.value}{label.ljust(18)}{Color.DIM.value}={Color.WHITE.value} {value}")
+
+    state = server.get("state", "")
+    state_colored = {
+        "running": f"{Color.GREEN.value}{state}{Color.WHITE.value}",
+        "stopped": f"{Color.DIM.value}{state}{Color.WHITE.value}",
+    }.get(state, f"{Color.RED.value}{state}{Color.WHITE.value}")
+
+    print(f"{Color.PURP.value}{server.get('name', '')}{Color.WHITE.value}  ({server.get('id', '')})")
+    line("state", f"{state_colored}  {server.get('state_detail', '') or ''}")
+    line("commercial_type", server.get("commercial_type", ""))
+    line("arch", server.get("arch", ""))
+    line("zone", server.get("zone", ""))
+    line("hostname", server.get("hostname", ""))
+    line("image", (server.get("image") or {}).get("name", ""))
+    line("creation_date", server.get("creation_date", ""))
+    line("modification_date", server.get("modification_date", ""))
+    line("tags", ", ".join(server.get("tags") or []) or f"{Color.DIM.value}(none){Color.WHITE.value}")
+    line("protected", server.get("protected", ""))
+    line("boot_type", server.get("boot_type", ""))
+    line("security_group", (server.get("security_group") or {}).get("name", ""))
+    line("project", server.get("project", ""))
+
+    public_ips = server.get("public_ips") or []
+    line("public_ips", f"{len(public_ips)}")
+    for ip in public_ips:
+        if type(ip) is not dict:
+            print(f"    {Color.RED.value}{ip}{Color.WHITE.value}")
+            continue
+        print(
+            f"    {Color.GREEN.value}{ip.get('address', '')}{Color.WHITE.value} ({ip.get('family', '')}) - {ip.get('id', '')}"
+        )
+    line("private_ip", server.get("private_ip") or f"{Color.DIM.value}(none){Color.WHITE.value}")
+
+    private_nics = server.get("private_nics") or []
+    if private_nics:
+        line("private_nics", f"{len(private_nics)}")
+        for nic in private_nics:
+            if type(nic) is not dict:
+                print(f"    {Color.RED.value}{nic}{Color.WHITE.value}")
+                continue
+            print(f"    {nic.get('mac_address', '')} - pn={nic.get('private_network_id', '')}")
+
+    volumes = server.get("volumes") or {}
+    line("volumes", f"{len(volumes)}")
+    for idx, vol in sorted(volumes.items()):
+        if type(vol) is not dict:
+            print(f"    {Color.RED.value}{idx}: {vol}{Color.WHITE.value}")
+            continue
+        size_gb = (vol.get("size") or 0) / 1_000_000_000
+        boot_marker = f" {Color.PURP.value}[boot]{Color.WHITE.value}" if vol.get("boot") else ""
+        print(f"    {idx}: {vol.get('name', '')}  {size_gb:.0f}GB {vol.get('volume_type', '')}{boot_marker}")
+
+    allowed = server.get("allowed_actions") or []
+    line("allowed_actions", ", ".join(allowed) if allowed else f"{Color.DIM.value}(none){Color.WHITE.value}")
+
+    print(
+        f"\n  {Color.DIM.value}cost: no per-resource API on Scaleway — "
+        f"see https://www.scaleway.com/en/pricing/ for {server.get('commercial_type', '?')} rate{Color.WHITE.value}"
+    )
+
+
 async def scaleway_remove_server(scaleway_api, server_id):
     print("WILL MAKE A DELETE ON THE RESOURCE, CHECK THE ACTUAL IMPLICATIONS")
     confirm(f"Will wipe server {server_id}. ")
@@ -1444,11 +1520,14 @@ async def scaleway_terminate_server(scaleway_api, server_id):
 async def scaleway_server(scaleway_api, args):
     if len(args) == 0:
         return await scaleway_servers(scaleway_api)
+    if len(args) == 2 and args[0] == "infos":
+        return await scaleway_server_infos(scaleway_api, args[1])
     if len(args) == 2 and args[0] == "terminate":
         return await scaleway_terminate_server(scaleway_api, args[1])
     if len(args) == 2 and args[0] == "remove":
         return await scaleway_remove_server(scaleway_api, args[1])
     print("cloud scaleway server")
+    print("cloud scaleway server infos {server_id}      === Shows IPs, volumes, status, etc.")
     print("cloud scaleway server terminate {server_id}  === Wipes attached storages")
     print("cloud scaleway server remove {server_id}     === Makes a delete - ?")
 
