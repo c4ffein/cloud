@@ -1,0 +1,48 @@
+diff --git a/cloud.py b/cloud.py
+index 54aaaad..04b47b9 100755
+--- a/cloud.py
++++ b/cloud.py
+@@ -6,7 +6,6 @@ MIT License - Copyright (c) 2025 c4ffein
+ WARNING: I don't recommend using this as-is. This a PoC, and usable by me because I know what I want to do with it.
+ - You can use it if you feel that you can edit the code yourself and you can live with my future breaking changes.
+ TODOs and possible improvements: Fill this
+-- TODO /me/changePassword for ovh
+ """
+
+ import os
+@@ -392,6 +391,12 @@ class OVHApi:
+             raise CloudException("Invalid ssh key")
+         return await self._make_request("POST", "/me/sshKey", {"keyName": name, "key": key})
+
++    # Account
++
++    async def change_password(self):
++        """Trigger a password change procedure on the OVH account (sends an email)"""
++        return await self._make_request("POST", "/me/changePassword")
++
+     # Domains
+
+     def _validate_domain(self, domain):
+@@ -1095,6 +1100,14 @@ async def ovh_ssh_keys(ovh_api, args):
+     print("cloud ovh ssh-key list\ncloud ovh ssh-key add name key")
+
+
++async def ovh_account(ovh_api, args):
++    if args == ["change-password"]:
++        confirm("This will trigger an OVH password-change procedure (an email will be sent). ")
++        pretty_print(await ovh_api.change_password())
++        return
++    print("cloud ovh account change-password")
++
++
+ async def ovh_domain(ovh_api, args):
+     async def refresh_zone(domain):
+         print(f"{Color.PURP.value} ! Now refreshing !")
+@@ -1567,6 +1580,7 @@ async def main():
+         "invoice": (lambda args: ovh_invoice(ovh_api, ovh_config), "ovh invoice"),
+         "dedicated-server": (lambda args: ovh_dedicated_server(ovh_api, args), "ovh dedicated-server"),
+         "ssh-key": (lambda args: ovh_ssh_keys(ovh_api, args), "ovh ssh-key"),
++        "account": (lambda args: ovh_account(ovh_api, args), "ovh account"),
+         "domain": (lambda args: ovh_domain(ovh_api, args), "ovh domain"),
+         "email": (lambda args: ovh_email(ovh_api, args), "ovh email"),
+         "telephony": (

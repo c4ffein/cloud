@@ -1,4 +1,4 @@
-.PHONY: help lint lint-check typecheck check format
+.PHONY: help lint lint-check typecheck verify format
 
 help:
 	@echo "cloud - Makefile commands"
@@ -6,7 +6,7 @@ help:
 	@echo "  make lint        - Fix linting issues with ruff"
 	@echo "  make lint-check  - Check linting without fixing"
 	@echo "  make typecheck   - Run ty type checker"
-	@echo "  make check       - Run all checks (lint + typecheck)"
+	@echo "  make verify      - Run all checks (lint + typecheck)"
 	@echo "  make format      - Format with ruff"
 
 lint:
@@ -18,7 +18,7 @@ lint-check:
 typecheck:
 	uv run ty check
 
-check: lint-check typecheck
+verify: lint-check typecheck
 
 format:
 	uv run ruff format

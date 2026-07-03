@@ -6,7 +6,7 @@ authors = [
 ]
 description = "KISS cli to interact with french cloud providers (OVH + Scaleway)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 
 [project.urls]
@@ -20,7 +20,7 @@ dev = [
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [
@@ -44,4 +44,4 @@ unresolved-attribute = "ignore"    # CloudConfig uses dynamic setattr from confi
 invalid-argument-type = "ignore"   # openssl_sha256 argument type is correct at runtime
 
 [tool.ty.environment]
-python-version = "3.10"
+python-version = "3.11"
