@@ -9,12 +9,13 @@ TODOs and possible improvements: Fill this
 """
 
 import os
+import subprocess
 import urllib.request
 from asyncio import gather, get_running_loop
 from asyncio import run as asyncio_run
 from base64 import b64decode
 from enum import Enum
-from functools import partial
+from functools import cache, partial
 from hashlib import sha1, sha256
 from json import dumps, loads
 from pathlib import Path
@@ -38,9 +39,11 @@ from sys import flags as sys_flags
 from time import time as time_time
 from urllib.error import HTTPError
 
-CAFILE = None  # Set from config "ssl-cafile", required
 LOWER_ALPHANUMERICAL_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 ALPHANUMERICAL_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+HEX_CHARS = frozenset("0123456789abcdef")
+PIN_COMMAND_TIMEOUT = 10  # seconds
+PIN_COMMAND_MAX_PINS = 16  # the old and the new certificate overlap during a rotation: a few, never many
 
 
 ########################################################################################################################
@@ -51,18 +54,21 @@ colors = {"RED": "31", "GREEN": "32", "PURP": "34", "DIM": "90", "WHITE": "39"}
 Color = Enum("Color", [(k, f"\033[{v}m") for k, v in colors.items()])
 
 
-def make_pinned_ssl_context(pinned_sha_256):
+def make_pinned_ssl_context(pinned_sha_256, cafile=None, capath=None, cadata=None):
     """
     Returns an instance of a subclass of SSLContext that uses a subclass of SSLSocket
     that actually verifies the sha256 of the certificate during the TLS handshake
+    pinned_sha_256 is a hex digest, or several of them: any is accepted (certificates overlap during a rotation)
     Tested with `python-version: [3.8, 3.9, 3.10, 3.11, 3.12, 3.13]`
     Original code can be found at https://github.com/c4ffein/python-snippets
     """
 
+    pinned = frozenset((pinned_sha_256,) if isinstance(pinned_sha_256, str) else pinned_sha_256)
+
     class PinnedSSLSocket(SSLSocket):
         def check_pinned_cert(self):
             der_cert_bin = self.getpeercert(True)
-            if sha256(der_cert_bin).hexdigest() != pinned_sha_256:
+            if sha256(der_cert_bin).hexdigest() not in pinned:
                 raise SSLCertVerificationError("Incorrect certificate checksum")
 
         def do_handshake(self, *args, **kwargs):
@@ -73,7 +79,7 @@ def make_pinned_ssl_context(pinned_sha_256):
     class PinnedSSLContext(SSLContext):
         sslsocket_class = PinnedSSLSocket
 
-    def create_pinned_default_context(purpose=Purpose.SERVER_AUTH, *, cafile=None, capath=None, cadata=None):
+    def create_pinned_default_context(purpose=Purpose.SERVER_AUTH):
         if not isinstance(purpose, _ASN1Object):
             raise TypeError(purpose)
         if purpose == Purpose.SERVER_AUTH:  # Verify certs and host name in client mode
@@ -94,11 +100,55 @@ def make_pinned_ssl_context(pinned_sha_256):
                 context.keylog_filename = keylogfile
         return context
 
-    return create_pinned_default_context(cafile=CAFILE)
+    return create_pinned_default_context()
 
 
 class CloudException(Exception):
     pass
+
+
+def validate_pin_command(value, label):
+    """
+    A configured certificate is a command, as a list (an argv), that prints the SHA256s to accept: see resolve_pins.
+    Returned as a tuple (hashable: resolve_pins caches on it).
+    """
+    if not isinstance(value, list):
+        raise CloudException(f"{label} must be a command (list of strings), got {type(value).__name__}")
+    if not value or not all(isinstance(arg, str) and arg and "\0" not in arg for arg in value):
+        raise CloudException(f"{label} command must be a non-empty list of non-empty strings")
+    return tuple(value)
+
+
+@cache
+def resolve_pins(command):
+    """
+    The SHA256 pins to accept for a certificate, as a tuple: what its configured command (an argv tuple) prints.
+    It is run as it is, without a shell, once per run, when a connection needs it. What is expected is what
+    tls-pin-get (https://github.com/c4ffein/crypto) does: exit code 0, and one SHA256 per line on stdout.
+    Anything else (a failure, no pin, a line that is not a SHA256) is an error: no connection is made.
+    """
+    shown = " ".join(command)
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=PIN_COMMAND_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise CloudException(f"Pin command timed out after {PIN_COMMAND_TIMEOUT}s: {shown}") from e
+    except (OSError, ValueError) as e:
+        raise CloudException(f"Pin command could not be run: {shown}: {e}") from e
+    if result.returncode != 0:
+        detail = " ".join(result.stderr.decode(errors="replace").split())[:200]
+        detail = "".join(c if c.isprintable() else "?" for c in detail)
+        raise CloudException(f"Pin command failed (exit code {result.returncode}): {shown}{detail and ': ' + detail}")
+    try:
+        pins = tuple(line.lower() for line in result.stdout.decode("ascii").removesuffix("\n").split("\n"))
+    except UnicodeDecodeError as e:
+        raise CloudException(f"Pin command printed something that is not a SHA256: {shown}") from e
+    if pins == ("",):
+        raise CloudException(f"Pin command printed no pin: {shown}")
+    if len(pins) > PIN_COMMAND_MAX_PINS:
+        raise CloudException(f"Pin command printed more than {PIN_COMMAND_MAX_PINS} pins: {shown}")
+    if any(len(pin) != 64 or any(c not in HEX_CHARS for c in pin) for pin in pins):
+        raise CloudException(f"Pin command printed something that is not a SHA256: {shown}")
+    return pins
 
 
 def confirm(message):
@@ -106,8 +156,33 @@ def confirm(message):
         raise CloudException("Operation cancelled from user input")
 
 
-async def make_request(cert_checksum, method, query, body, headers, decode_json=True, decode_utf8=True):
-    context = make_pinned_ssl_context(cert_checksum)
+def atomic_write(path, data):
+    """
+    Write data (bytes) to path through a temp file next to it, created 0o600: path ends up complete, or untouched.
+    The temp file has a fixed name, path + ".tmp", and is created exclusively, so it is also the lock: what a run
+    could not remove (killed, power cut) does not pile up unnoticed, the next run for that path refuses and names it.
+    """
+    path = Path(path)
+    tmp_path = path.with_name(f"{path.name}.tmp")
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise CloudException(
+            f"{tmp_path} already exists: either it is being written, or a killed run left it and it can be removed"
+        ) from None
+    try:
+        with os.fdopen(fd, "wb") as f:  # write() of a file object goes on until everything is written, or raises
+            f.write(data)
+        tmp_path.replace(path)
+    except BaseException:  # Ctrl-C included. If this unlink fails too, both errors are shown, and path is untouched
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+async def make_request(pin_command, method, query, body, headers, *, cafile, decode_json=True, decode_utf8=True):
+    # Resolved out of the try below: a pin command that fails must say so, not end up as an unknown error
+    # And not in a thread: gathered requests wait for the one run of the command instead of each starting their own
+    context = make_pinned_ssl_context(resolve_pins(pin_command), cafile=cafile)
     loop = get_running_loop()
     request = urllib.request.Request(query, data=body.encode("utf-8") if body else None, headers=headers, method=method)
     try:
@@ -152,7 +227,9 @@ async def make_request(cert_checksum, method, query, body, headers, decode_json=
 
 
 class OVHApi:
-    def __init__(self, cert_checksum, pdf_cert_checksum, application_key, application_secret, consumer_key):
+    def __init__(self, pin_command, pdf_pin_command, application_key, application_secret, consumer_key, cafile):
+        """pin_command, pdf_pin_command: commands (argv tuples) that print the pinned SHA256s, see resolve_pins"""
+        self.cafile = cafile
         self.application_key = application_key
         self.application_secret = application_secret
         self.consumer_key = consumer_key
@@ -163,8 +240,8 @@ class OVHApi:
             "ovh-ca": "https://ca.api.ovh.com/1.0",  # unused for now
         }
         self.base_url = self.endpoints["ovh-eu"]
-        self.cert_checksum = cert_checksum
-        self.pdf_cert_checksum = pdf_cert_checksum
+        self.pin_command = pin_command
+        self.pdf_pin_command = pdf_pin_command
 
     # Auth helpers
 
@@ -196,13 +273,14 @@ class OVHApi:
         headers["X-Ovh-Signature"] = self._calculate_signature(method, query, body, timestamp)
         # Create request
         return await make_request(
-            self.cert_checksum if base_url is None else self.pdf_cert_checksum,
+            self.pin_command if base_url is None else self.pdf_pin_command,
             method,
             query,
             body,
             headers,
             decode_json=decode_json,
             decode_utf8=decode_utf8,
+            cafile=self.cafile,
         )
 
     # Invoices
@@ -696,6 +774,11 @@ class OVHApi:
         results = await gather(*(self._make_request("GET", f"/me/order/{order}") for order in orders))
         return dict(zip(orders, results, strict=False))
 
+    async def get_order(self, order_id):
+        """Get details of a specific order"""
+        self._validate_order_id(order_id)
+        return await self._make_request("GET", f"/me/order/{order_id}")
+
     async def pay_order(self, order_id, payment_method_id):
         """WARNING only handles credit cards for now - AND NEVER WORKED FOR DOMAINS!"""
         self._validate_order_id(order_id)
@@ -722,8 +805,10 @@ class OVHApi:
 
 
 class ScalewayApi:
-    def __init__(self, cert_checksum, secret_key, organization_id):
-        self.cert_checksum = cert_checksum
+    def __init__(self, pin_command, secret_key, organization_id, cafile):
+        """pin_command: command (argv tuple) that prints the pinned SHA256s, see resolve_pins"""
+        self.cafile = cafile
+        self.pin_command = pin_command
         self.secret_key = secret_key
         self.organization_id = organization_id
         self.base_url = "https://api.scaleway.com"
@@ -741,7 +826,14 @@ class ScalewayApi:
             headers["Content-Length"] = str(len(body))
         # Create request
         return await make_request(
-            self.cert_checksum, method, query, body, headers, decode_json=decode_json, decode_utf8=decode_utf8
+            self.pin_command,
+            method,
+            query,
+            body,
+            headers,
+            decode_json=decode_json,
+            decode_utf8=decode_utf8,
+            cafile=self.cafile,
         )
 
     # Invoices
@@ -816,6 +908,7 @@ class CloudConfig:
     name = None
     required = []
     optional = ["invoice-path"]
+    pin_commands = ["certificate"]  # keys holding a command that prints the SHA256s to accept, see resolve_pins
 
     def __init__(self, config_dict):
         missing_keys = set(self.required) - set(config_dict.keys())
@@ -829,8 +922,8 @@ class CloudConfig:
         for k in self.optional:
             if not hasattr(self, k.replace("-", "_")):
                 setattr(self, k.replace("-", "_"), None)
-        if type(self.certificate) is not str or len(self.certificate) != 64:
-            raise CloudException(f"Unexpected certificate format for {self.name} certificate {self.certificate}")
+        for k in self.pin_commands:  # validated here, run when connecting
+            setattr(self, k.replace("-", "_"), validate_pin_command(config_dict[k], f"{self.name} {k}"))
         if self.invoice_path is not None:
             if "{year}" not in self.invoice_path or "{invoice_id}" not in self.invoice_path:
                 raise CloudException(
@@ -841,6 +934,7 @@ class CloudConfig:
 class OVHConfig(CloudConfig):
     name = "OVH"
     required = ["certificate", "application-key", "application-secret", "consumer-key", "pdf-certificate"]
+    pin_commands = ["certificate", "pdf-certificate"]
 
 
 class ScalewayConfig(CloudConfig):
@@ -849,7 +943,6 @@ class ScalewayConfig(CloudConfig):
 
 
 def load_config():
-    global CAFILE
     try:
         with (Path.home() / ".config" / "cloud" / "config.json").open() as f:
             config_content = f.read()
@@ -859,10 +952,10 @@ def load_config():
         config_dict = loads(config_content)
     except Exception:
         raise CloudException("Unable to parse config file as json") from None
-    if "ssl-cafile" not in config_dict or type(config_dict["ssl-cafile"]) is not str:
+    cafile = config_dict.get("ssl-cafile")
+    if type(cafile) is not str or not cafile:  # an empty one would silently mean the system store
         raise CloudException("Missing or invalid 'ssl-cafile' in config")
-    CAFILE = config_dict["ssl-cafile"]
-    return OVHConfig(config_dict.get("ovh", {})), ScalewayConfig(config_dict.get("scaleway", {}))
+    return OVHConfig(config_dict.get("ovh", {})), ScalewayConfig(config_dict.get("scaleway", {})), cafile
 
 
 ########################################################################################################################
@@ -875,6 +968,14 @@ def usage(wrong_config=False):
         "───────────────────────────────────────────",
         """~/.config/cloud/config.json => {"ssl-cafile": "/path/to/cacert.pem",""",
         """                                "ovh": {...}, "scaleway": {...}}""",
+        "───────────────────────────────────────────",
+        "certificate and pdf-certificate are not hashes but commands that print some, as lists: full path, then arguments",
+        """e.g. ["/home/you/.local/bin/tls-pin-get", "eu.api.ovh.com:443"], tls-pin-get is from https://github.com/c4ffein/crypto""",
+        "- run as it is (no shell, no ~), when a connection needs it, once per run",
+        "- must exit with 0 and print SHA256 hashes of DER certificates, one per line: any of them is accepted",
+        "- no connection when it fails, prints nothing, or prints anything else",
+        "- whoever can edit the config file can run commands as you: keep it 0600",
+        """- a hash that never changes: ["/bin/echo", "sha256_hash_of_the_der_certificate"]""",
         "───────────────────────────────────────────",
         "You can set /* for any verb when generating your OVH api key",
         "───────────────────────────────────────────",
@@ -1296,8 +1397,7 @@ async def ovh_telephony(ovh_api, args):
         audio_data = await ovh_api.download_voicemail_message(args[1], args[2], args[3], audio_format)
         filename = f"voicemail_{args[1]}_{args[2]}_{args[3]}.{audio_format}"
 
-        with Path(filename).open("wb") as f:
-            f.write(audio_data)
+        atomic_write(filename, audio_data)
 
         print(f"{Color.GREEN.value}Downloaded voicemail message to {filename}{Color.WHITE.value}")
         return
@@ -1310,8 +1410,7 @@ async def ovh_telephony(ovh_api, args):
         audio_data = await ovh_api.download_voicemail_greeting(args[1], args[2], args[3], audio_format)
         filename = f"greeting_{args[1]}_{args[2]}_{args[3]}.{audio_format}"
 
-        with Path(filename).open("wb") as f:
-            f.write(audio_data)
+        atomic_write(filename, audio_data)
 
         print(f"{Color.GREEN.value}Downloaded voicemail greeting to {filename}{Color.WHITE.value}")
         return
@@ -1395,7 +1494,15 @@ async def ovh_orders(ovh_api, args):
         pretty_print(response)
         return
     if len(args) == 3 and args[0] == "pay":
+        order_details = await ovh_api.get_order(args[1])
+        pretty_print(order_details)
+        price_with_tax = order_details.get("priceWithTax") if type(order_details) is dict else None
+        price_text = price_with_tax.get("text") if type(price_with_tax) is dict else None
         print(f"\n    {Color.RED.value}WARNING CREDIT_CARD was refused for domains{Color.WHITE.value}\n")
+        confirm(
+            f"Will pay order {args[1]}{f' ({price_text})' if price_text else ''} "
+            f"with payment method {args[2]} - THIS WILL CHARGE YOUR REGISTERED CREDIT CARD. "
+        )
         response_pay = await ovh_api.pay_order(order_id=args[1], payment_method_id=args[2])
         pretty_print(response_pay)
         return
@@ -1560,20 +1667,23 @@ async def scaleway_server(scaleway_api, args):
 
 
 async def main():
-    ovh_config, scaleway_config = load_config()
-    if not ovh_config or not scaleway_config:
+    loaded_config = load_config()
+    if not loaded_config:
         return usage()  # TODO Better to show config
+    ovh_config, scaleway_config, cafile = loaded_config
     ovh_api = OVHApi(
-        cert_checksum=ovh_config.certificate,
-        pdf_cert_checksum=ovh_config.pdf_certificate,
+        pin_command=ovh_config.certificate,
+        pdf_pin_command=ovh_config.pdf_certificate,
         application_key=ovh_config.application_key,
         application_secret=ovh_config.application_secret,
         consumer_key=ovh_config.consumer_key,
+        cafile=cafile,
     )
     scaleway_api = ScalewayApi(
-        cert_checksum=scaleway_config.certificate,
+        pin_command=scaleway_config.certificate,
         secret_key=scaleway_config.secret_key,
         organization_id=scaleway_config.organization_id,
+        cafile=cafile,
     )
     ovh_cmds = {
         "vps": (lambda args: ovh_vps(ovh_api, args), "ovh vps"),

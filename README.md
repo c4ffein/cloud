@@ -10,10 +10,10 @@ Single file, no `requests`, no `click`, no `boto3` — just `urllib`, `ssl`, and
 - **Scaleway**: servers, domains, invoices
 
 ### What it cares about
-- TLS certificate pinning on every request
+- TLS certificate pinning on every request — pins come from a command you configure (e.g. `tls-pin-get` from [crypto](https://github.com/c4ffein/crypto)), so they can rotate
 - Paranoid input validation before anything touches a URL
 - Parallel API calls via `asyncio.gather`
-- Atomic writes for invoice PDF downloads
+- Atomic writes for invoice PDF and voicemail downloads
 
 ### Disclaimer
 I don't recommend using this as-is — this is a PoC, usable by me because I know what I want to do with it.
