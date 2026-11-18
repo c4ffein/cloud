@@ -44,6 +44,7 @@ ALPHANUMERICAL_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrst
 HEX_CHARS = frozenset("0123456789abcdef")
 PIN_COMMAND_TIMEOUT = 10  # seconds
 PIN_COMMAND_MAX_PINS = 16  # the old and the new certificate overlap during a rotation: a few, never many
+REQUEST_TIMEOUT = 30  # seconds, to connect and then for each read: without one, a stalled connection hangs forever
 
 
 ########################################################################################################################
@@ -116,6 +117,8 @@ def validate_pin_command(value, label):
         raise CloudException(f"{label} must be a command (list of strings), got {type(value).__name__}")
     if not value or not all(isinstance(arg, str) and arg and "\0" not in arg for arg in value):
         raise CloudException(f"{label} command must be a non-empty list of non-empty strings")
+    if not Path(value[0]).is_absolute():  # no PATH lookup, nothing relative to wherever cloud is run from
+        raise CloudException(f"{label} command must start with a full path, got {value[0]!r}")
     return tuple(value)
 
 
@@ -128,6 +131,8 @@ def resolve_pins(command):
     Anything else (a failure, no pin, a line that is not a SHA256) is an error: no connection is made.
     """
     shown = " ".join(command)
+    if not Path(command[0]).is_absolute():  # validate_pin_command already refuses it: checked again where it is run
+        raise CloudException(f"Pin command must start with a full path: {shown}")
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=PIN_COMMAND_TIMEOUT)
     except subprocess.TimeoutExpired as e:
@@ -149,6 +154,15 @@ def resolve_pins(command):
     if any(len(pin) != 64 or any(c not in HEX_CHARS for c in pin) for pin in pins):
         raise CloudException(f"Pin command printed something that is not a SHA256: {shown}")
     return pins
+
+
+def is_valid_id(value, charset):
+    """
+    What may go in a URL or in a file name: a non-empty str, made of chars of charset only, not starting with a dot.
+    - a str: on anything else `c in charset` is not a char test, the list ["ab", "12"] would pass as substrings
+    - not empty, not . or ..: the URL built with it would be the one of another resource (its parent, its collection)
+    """
+    return type(value) is str and value != "" and not value.startswith(".") and all(c in charset for c in value)
 
 
 def confirm(message):
@@ -173,10 +187,28 @@ def atomic_write(path, data):
     try:
         with os.fdopen(fd, "wb") as f:  # write() of a file object goes on until everything is written, or raises
             f.write(data)
+        if tmp_path.read_bytes() != data:  # paranoid
+            raise CloudException(f"{tmp_path} did not hold what was just written to it")
         tmp_path.replace(path)
     except BaseException:  # Ctrl-C included. If this unlink fails too, both errors are shown, and path is untouched
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """
+    A redirect is never followed. urllib would send every header along, credentials included, wherever the server
+    says: plain http included, where neither TLS nor the pin applies. With None, urllib raises the 3xx as an HTTPError.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def open_url(request, context):
+    """urlopen, but with a timeout and without following redirects"""
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), NoRedirectHandler)
+    return opener.open(request, timeout=REQUEST_TIMEOUT)
 
 
 async def make_request(pin_command, method, query, body, headers, *, cafile, decode_json=True, decode_utf8=True):
@@ -186,9 +218,13 @@ async def make_request(pin_command, method, query, body, headers, *, cafile, dec
     loop = get_running_loop()
     request = urllib.request.Request(query, data=body.encode("utf-8") if body else None, headers=headers, method=method)
     try:
-        response = await loop.run_in_executor(None, partial(urllib.request.urlopen, request, context=context))
+        response = await loop.run_in_executor(None, partial(open_url, request, context=context))
         data = await loop.run_in_executor(None, response.read)
     except HTTPError as exc:
+        if 300 <= exc.code < 400:
+            raise CloudException(
+                f"Cloud answered with a redirect ({exc.code}): not followed, the credentials would go along"
+            ) from exc
         additional_infos = ""
         try:
             additional_infos = exc.read()
@@ -288,13 +324,13 @@ class OVHApi:
     async def list_invoices(self):
         """List all invoices"""
         invoice_ids = await self._make_request("GET", "/me/bill")
-        if any(not all(c in "FR0123456789" for c in invoice_id) for invoice_id in invoice_ids):
+        if not all(is_valid_id(invoice_id, "FR0123456789") for invoice_id in invoice_ids):
             raise CloudException("Invalid invoice id")
         return invoice_ids
 
     async def get_invoice_details(self, invoice_id):
         """Get details of a specific invoice"""
-        if not all(c in "FR0123456789" for c in invoice_id):
+        if not is_valid_id(invoice_id, "FR0123456789"):
             raise CloudException("Invalid invoice id")
         return await self._make_request("GET", f"/me/bill/{invoice_id}")
 
@@ -317,10 +353,17 @@ class OVHApi:
             "GET", pdf_url[33:], decode_json=False, decode_utf8=False, base_url=pdf_url[:33]
         )
 
+    # SSH key validation (the key itself: it goes in a JSON body, never in a URL)
+
+    def _validate_ssh_key(self, ssh_key):
+        """type base64 comment: + / = are base64, the others are for key types and user@host comments"""
+        if type(ssh_key) is not str or not ssh_key or not all(c in ALPHANUMERICAL_CHARS + "+/= .-@_" for c in ssh_key):
+            raise CloudException("Invalid ssh key")
+
     # VPS
 
     def _validate_vps_id(self, vps_id):
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in vps_id):
+        if not is_valid_id(vps_id, LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid vps id")
 
     async def list_vps(self):
@@ -385,8 +428,7 @@ class OVHApi:
 
     async def reinstall_vps(self, vps_name, ssh_key, template_id=0):
         self._validate_vps_id(vps_name)
-        if not all(c in ALPHANUMERICAL_CHARS + ".- @/" for c in ssh_key):
-            raise CloudException("Invalid ssh key")
+        self._validate_ssh_key(ssh_key)
         try:
             template_id = int(template_id)
         except Exception as exc:
@@ -401,7 +443,7 @@ class OVHApi:
     # Server
 
     def _validate_server_id(self, server_id):
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in server_id):
+        if not is_valid_id(server_id, LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid server id")
 
     async def list_server(self):
@@ -439,8 +481,7 @@ class OVHApi:
 
     async def reinstall_server(self, server_name, ssh_key, operating_system="debian12_64"):
         self._validate_server_id(server_name)
-        if not all(c in ALPHANUMERICAL_CHARS + ".- @/" for c in ssh_key):
-            raise CloudException("Invalid ssh key")
+        self._validate_ssh_key(ssh_key)
         reinstall_body = {
             "operatingSystem": operating_system,
             "customizations": {"sshKey": ssh_key},
@@ -456,17 +497,16 @@ class OVHApi:
     async def list_ssh_keys(self):
         """List all SSH keys in your OVH account"""
         ssh_key_names = await self._make_request("GET", "/me/sshKey")
-        if any(not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in key_name) for key_name in ssh_key_names):
+        if not all(is_valid_id(key_name, LOWER_ALPHANUMERICAL_CHARS + ".-") for key_name in ssh_key_names):
             raise CloudException("Invalid ssh key name")
         results = await gather(*(self._make_request("GET", f"/me/sshKey/{key_name}") for key_name in ssh_key_names))
         return dict(zip(ssh_key_names, results, strict=False))
 
     async def add_ssh_key(self, name, key):
         """Add an ssh key to your OVH account"""
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in name):
+        if not is_valid_id(name, LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid ssh key name")
-        if not all(c in ALPHANUMERICAL_CHARS + ".-@ " for c in key):
-            raise CloudException("Invalid ssh key")
+        self._validate_ssh_key(key)
         return await self._make_request("POST", "/me/sshKey", {"keyName": name, "key": key})
 
     # Account
@@ -478,11 +518,11 @@ class OVHApi:
     # Domains
 
     def _validate_domain(self, domain):
-        if any(c not in ALPHANUMERICAL_CHARS + "." for c in domain):
+        if not is_valid_id(domain, ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid domain")
 
     def _validate_record_id(self, record_id):
-        if any(c not in LOWER_ALPHANUMERICAL_CHARS + "-." for c in str(record_id)):
+        if not is_valid_id(str(record_id) if type(record_id) is int else record_id, LOWER_ALPHANUMERICAL_CHARS + "-."):
             raise CloudException("Invalid record id")
 
     async def list_domain(self):
@@ -568,7 +608,7 @@ class OVHApi:
     # Cart
 
     def _validate_cart_id(self, cart_id):
-        if not all(c in "0123456789abcdef-" for c in cart_id):
+        if not is_valid_id(cart_id, "0123456789abcdef-"):
             raise CloudException("Invalid cart id")
 
     async def create_cart(self, description):
@@ -596,7 +636,7 @@ class OVHApi:
 
     async def add_domain_to_cart(self, domain_name, cart_id):
         self._validate_cart_id(cart_id)
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in domain_name):
+        if not is_valid_id(domain_name, LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid domain name")
         return await self._make_request(
             "POST",
@@ -612,11 +652,11 @@ class OVHApi:
     # Emails
 
     def _validate_email_domain_name(self, domain_name):
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in domain_name):
+        if not is_valid_id(domain_name, LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid email domain name")
 
     def _validate_email_account_name(self, account_name):
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-_" for c in account_name):
+        if not is_valid_id(account_name, LOWER_ALPHANUMERICAL_CHARS + ".-_"):
             raise CloudException("Invalid email account name")
 
     async def list_all_email_domains(self):
@@ -678,17 +718,17 @@ class OVHApi:
     # Telephony Voicemail
 
     def _validate_billing_account(self, billing_account):
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in billing_account):
+        if not is_valid_id(billing_account, LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid billing account")
 
     def _validate_service_name(self, service_name):
-        if not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in service_name):
+        if not is_valid_id(service_name, LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException("Invalid service name")
 
     async def list_telephony_services(self):
         """List all telephony services (billing accounts)"""
         billing_accounts = await self._make_request("GET", "/telephony")
-        if any(not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in account) for account in billing_accounts):
+        if not all(is_valid_id(account, LOWER_ALPHANUMERICAL_CHARS + ".-") for account in billing_accounts):
             raise CloudException("Invalid billing account")
         return billing_accounts
 
@@ -696,7 +736,7 @@ class OVHApi:
         """List all voicemail services for a billing account"""
         self._validate_billing_account(billing_account)
         services = await self._make_request("GET", f"/telephony/{billing_account}/voicemail")
-        if any(not all(c in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in service) for service in services):
+        if not all(is_valid_id(service, LOWER_ALPHANUMERICAL_CHARS + ".-") for service in services):
             raise CloudException("Invalid voicemail service")
         return services
 
@@ -764,7 +804,7 @@ class OVHApi:
     # Orders
 
     def _validate_order_id(self, order_id):
-        if not all(c in "0123456789" for c in str(order_id)):
+        if not is_valid_id(str(order_id) if type(order_id) is int else order_id, "0123456789"):
             raise CloudException("Invalid order id")
 
     async def list_orders(self):
@@ -782,7 +822,9 @@ class OVHApi:
     async def pay_order(self, order_id, payment_method_id):
         """WARNING only handles credit cards for now - AND NEVER WORKED FOR DOMAINS!"""
         self._validate_order_id(order_id)
-        if not all(c in "0123456789" for c in str(payment_method_id)):
+        if not is_valid_id(
+            str(payment_method_id) if type(payment_method_id) is int else payment_method_id, "0123456789"
+        ):
             raise CloudException("Invalid payment method id")
         return await self._make_request(
             "POST",
@@ -842,17 +884,17 @@ class ScalewayApi:
         """List all invoices"""
         invoices_data = await self._make_request("GET", "/billing/v2beta1/invoices")
         invoices_data_list = invoices_data["invoices"]
-        if any(not all(c in "0123456789abcdef-" for c in invoice["id"]) for invoice in invoices_data_list):
+        if not all(is_valid_id(invoice["id"], "0123456789abcdef-") for invoice in invoices_data_list):
             raise CloudException("Invalid invoice id")
-        if any(not all(c in "0123456789TZ-:." for c in invoice["issued_date"]) for invoice in invoices_data_list):
+        if not all(is_valid_id(invoice["issued_date"], "0123456789TZ-:.") for invoice in invoices_data_list):
             raise CloudException("Invalid issued date")
         return invoices_data_list
 
     async def get_invoice_pdf(self, invoice_id):
-        if type(invoice_id) is not str or any(c not in "0123456789abcdef-" for c in invoice_id):
+        if not is_valid_id(invoice_id, "0123456789abcdef-"):
             raise CloudException(f"Invalid invoice id {invoice_id}")
         r = await self._make_request("GET", f"/billing/v2beta1/invoices/{invoice_id}/download")
-        if any(c not in LOWER_ALPHANUMERICAL_CHARS + ".-" for c in r["name"]):
+        if not is_valid_id(r["name"], LOWER_ALPHANUMERICAL_CHARS + ".-"):
             raise CloudException(f"Invalid invoice name {r['name']}")
         try:
             bytes_content = b64decode(r["content"])
@@ -868,21 +910,21 @@ class ScalewayApi:
 
     async def get_server(self, server_id):
         server_id = server_id.lower()
-        if not all(c in "0123456789abcdef-" for c in server_id) or len(server_id) != 36:
+        if not is_valid_id(server_id, "0123456789abcdef-") or len(server_id) != 36:
             raise CloudException("Invalid server id")
         print(f"{Color.RED.value}WARNING: ONLY CHECKING A SINGLE ZONE FOR NOW...{Color.WHITE.value}")
         return await self._make_request("GET", f"/instance/v1/zones/fr-par-1/servers/{server_id}")
 
     async def remove_server(self, server_id):
         server_id = server_id.lower()
-        if not all(c in "0123456789abcdef-" for c in server_id) or len(server_id) != 36:
+        if not is_valid_id(server_id, "0123456789abcdef-") or len(server_id) != 36:
             raise CloudException("Invalid server id")
         print(f"{Color.RED.value}WARNING: ONLY CHECKING A SINGLE ZONE FOR NOW...{Color.WHITE.value}")
         return await self._make_request("DELETE", f"/instance/v1/zones/fr-par-1/servers/{server_id}")
 
     async def terminate_server(self, server_id):
         server_id = server_id.lower()
-        if not all(c in "0123456789abcdef-" for c in server_id) or len(server_id) != 36:
+        if not is_valid_id(server_id, "0123456789abcdef-") or len(server_id) != 36:
             raise CloudException("Invalid server id")
         print(f"{Color.RED.value}WARNING: ONLY CHECKING A SINGLE ZONE FOR NOW...{Color.WHITE.value}")
         return await self._make_request(
@@ -895,7 +937,7 @@ class ScalewayApi:
         return await self._make_request("GET", "/domain/v2beta1/dns-zones")
 
     async def get_domain(self, project_id):
-        if type(project_id) is not str or any(c not in "0123456789abcdef-" for c in project_id):
+        if not is_valid_id(project_id, "0123456789abcdef-"):
             raise CloudException(f"Invalid project-id {project_id}")
         return await self._make_request("GET", f"/domain/v2beta1/dns-zones/{project_id}")
 
@@ -943,11 +985,18 @@ class ScalewayConfig(CloudConfig):
 
 
 def load_config():
+    path = Path.home() / ".config" / "cloud" / "config.json"
     try:
-        with (Path.home() / ".config" / "cloud" / "config.json").open() as f:
+        with path.open() as f:
+            config_stat = os.fstat(f.fileno())  # of the file that is read, not of what is at the path a moment later
             config_content = f.read()
     except Exception:
         return None
+    # It holds secrets, and commands that get run (see validate_pin_command): nobody else may write or read it
+    if config_stat.st_uid != os.geteuid():
+        raise CloudException(f"{path} is not owned by you: not used")
+    if config_stat.st_mode & 0o077:
+        raise CloudException(f"{path} is accessible by group or others: not used, chmod 600 it")
     try:
         config_dict = loads(config_content)
     except Exception:
@@ -974,7 +1023,7 @@ def usage(wrong_config=False):
         "- run as it is (no shell, no ~), when a connection needs it, once per run",
         "- must exit with 0 and print SHA256 hashes of DER certificates, one per line: any of them is accepted",
         "- no connection when it fails, prints nothing, or prints anything else",
-        "- whoever can edit the config file can run commands as you: keep it 0600",
+        "- whoever can edit the config file can run commands as you: it is refused unless it is yours and 0600",
         """- a hash that never changes: ["/bin/echo", "sha256_hash_of_the_der_certificate"]""",
         "───────────────────────────────────────────",
         "You can set /* for any verb when generating your OVH api key",
@@ -999,6 +1048,16 @@ def consume_parameters(args, mandatories=None, optionals=None):
         [a for a in args if not any(a.startswith(f"{p}=") for p in (*mandatories, *optionals))],
         {a[: len(n)]: a[len(n) + 1 :] for a in args for n in (*mandatories, *optionals) if a.startswith(f"{n}=")},
     )
+
+
+def save_invoice(pdf_path, pdf_content):
+    if not pdf_content.startswith(b"%PDF-1."):
+        raise CloudException(f"Not a PDF, not saved: what was downloaded for {pdf_path}")
+    if not pdf_path.parent.exists():
+        raise CloudException(f"Directory does not exist: {pdf_path.parent}")
+    print(f"=> Writing {pdf_path}")
+    atomic_write(pdf_path, pdf_content)
+    print(f"=> Validated and written to {pdf_path}")
 
 
 async def ovh_invoice(ovh_api, ovh_config):
@@ -1030,23 +1089,12 @@ async def ovh_invoice(ovh_api, ovh_config):
                 year=invoice_year, invoice_id=invoice_id, value=value, printable_date=printable_date
             )
         )
-        pdf_path_tmp = Path(f"{pdf_path}.tmp")
         if not pdf_path.exists():
             print(f"Downloading {invoice_id}")
             print(invoice)
             pdf_url = invoice.get("pdfUrl")
             downloaded_pdf_content = await ovh_api.get_invoice_pdf(pdf_url)
-            print(f"=> Writing {pdf_path_tmp}")
-            if not pdf_path_tmp.parent.exists():
-                raise CloudException(f"Directory does not exist: {pdf_path_tmp.parent}")
-            with pdf_path_tmp.open("wb") as f:
-                f.write(downloaded_pdf_content)
-            with pdf_path_tmp.open("rb") as f:
-                verif_pdf_content = f.read()
-            if not verif_pdf_content.startswith(b"%PDF-1.") or verif_pdf_content != downloaded_pdf_content:  # paranoid
-                raise CloudException(f"Error on invoice save: check {pdf_path_tmp}")
-            pdf_path_tmp.rename(pdf_path)
-            print(f"=> Validated and moved to {pdf_path}")
+            save_invoice(pdf_path, downloaded_pdf_content)
             downloaded_count += 1
     print(f"Downloaded {downloaded_count}/{len(invoices)} invoices")
 
@@ -1325,6 +1373,7 @@ async def ovh_email(ovh_api, args):
         pretty_print(await ovh_api.update_account_quota(*args[1:]))
         return
     if len(args) == 3 and args[0] == "delete-account":
+        confirm(f"Will delete the email account {args[2]} of {args[1]}, and the mails it holds. ")
         pretty_print(await ovh_api.delete_an_email_account(args[1], args[2]))
         return
     if len(args) >= 1 and args[0] == "list-email-redirections":
@@ -1395,7 +1444,7 @@ async def ovh_telephony(ovh_api, args):
             audio_format = args[5]
 
         audio_data = await ovh_api.download_voicemail_message(args[1], args[2], args[3], audio_format)
-        filename = f"voicemail_{args[1]}_{args[2]}_{args[3]}.{audio_format}"
+        filename = f"voicemail_{args[1]}_{args[2]}_{int(args[3])}.{audio_format}"  # the id as parsed, not as typed
 
         atomic_write(filename, audio_data)
 
@@ -1408,7 +1457,7 @@ async def ovh_telephony(ovh_api, args):
             audio_format = args[5]
 
         audio_data = await ovh_api.download_voicemail_greeting(args[1], args[2], args[3], audio_format)
-        filename = f"greeting_{args[1]}_{args[2]}_{args[3]}.{audio_format}"
+        filename = f"greeting_{args[1]}_{args[2]}_{int(args[3])}.{audio_format}"  # the id as parsed, not as typed
 
         atomic_write(filename, audio_data)
 
@@ -1461,6 +1510,7 @@ async def ovh_buy(ovh_api, args):
         return await ovh_api.create_cart(args[1])
     # Cancel
     if len(args) == 2 and args[0] == "cancel":
+        confirm(f"Will cancel cart {args[1]}. ")
         return await ovh_api.cancel_cart(args[1])
     # View
     if len(args) == 2 and args[0] == "view":
@@ -1544,19 +1594,10 @@ async def scaleway_invoice(scaleway_api, scaleway_config):
                 year=invoice_year, invoice_id=invoice_id, printable_date=invoice_short_date
             )
         )
-        pdf_path_tmp = Path(f"{pdf_path}.tmp")
         if not pdf_path.exists():
             print(f"Downloading {invoice_id} for {invoice_short_date}")
             downloaded_pdf_name, downloaded_pdf_content = await scaleway_api.get_invoice_pdf(invoice_id)
-            print(f"=> Writing {pdf_path_tmp}")
-            with pdf_path_tmp.open("wb") as f:
-                f.write(downloaded_pdf_content)
-            with pdf_path_tmp.open("rb") as f:
-                verif_pdf_content = f.read()
-            if not verif_pdf_content.startswith(b"%PDF-1.") or verif_pdf_content != downloaded_pdf_content:  # paranoid
-                raise CloudException(f"Error on invoice save: check {pdf_path_tmp}")
-            pdf_path_tmp.rename(pdf_path)
-            print(f"=> Validated and moved to {pdf_path}")
+            save_invoice(pdf_path, downloaded_pdf_content)
             downloaded_count += 1
     print(f"Downloaded {downloaded_count}/{len(invoices)} invoices")
 
